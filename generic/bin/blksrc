@@ -1,0 +1,33 @@
+#!/bin/bash
+#
+# Locate the source device file.
+# This script will translate a path like /dev/mapper/device or /dev/dm-1 
+# to it's original source like /dev/sda2 or /dev/nvme0n1p2
+#
+
+if [ -z "$1" ]; then
+    echo "Usage: blksrc <device>" >&2; exit 1
+fi
+
+DEV="`readlink -f "$1"`"
+CLASS="`readlink -f /sys/**/block/$(basename "$DEV")`"
+
+if [ ! -b "$DEV" ]; then
+    echo "The device $DEV is not a block device" >&2; exit 1
+    
+elif [ ! -d "$CLASS" ]; then
+    echo "No class exists for the device $DEV" >&2; exit 1
+fi
+
+for link in $CLASS/slaves/*; do
+    if [ -e "$link" ]; then
+        name="`basename $link`"
+
+        if [ -b /dev/$name ]; then
+            echo /dev/$name; exit 0
+        fi
+    fi
+done
+
+echo $DEV
+

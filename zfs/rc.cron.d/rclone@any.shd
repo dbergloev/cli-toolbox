@@ -1,0 +1,146 @@
+#!/bin/bash
+#
+# Automated sync of datasets using rclone. 
+# ----------------------------------------
+#
+# This script will run rclone sync/copy on any ZFS dataset
+# that has been configured for it.  
+#
+#
+# Configure the dataset by adding a few properties. 
+# 
+#   * rclone:sync=1
+#   * rclone:sync.path=<name:path>      # RClone path like koofr:MyFolder
+#   * rclone:sync.user=<user>           # A user with ~/.config/rclone/rclone.conf
+#   * rclone:sync.do_<timer>=<action>   # Example: 'rclone:sync.do_daily=sync' and/or 'rclone:sync.do_hourly=copy'
+#
+
+timer="$1"
+
+declare -A priorities=(
+    ["info"]="low"
+    ["warning"]="medium"
+    ["error"]="high" 
+    ["critical"]="critical"
+)
+
+###
+#
+#
+case $timer in
+    startup|shutdown) exit 0 ;; # Unused
+    *)
+        if ! ip r | grep -qe '^default\b'; then
+            exit 0  # Network is down
+        fi
+    ;;
+esac
+
+###
+#
+#
+get_prop_all() {
+    zfs get -o $1 -H -r -s local -t filesystem $2 $3
+}
+
+get_prop() {
+    zfs get -o $1 -H $2 $3
+}
+
+is_mounted() {
+    zfs get -o value -H mounted $1 | grep -q 'yes'
+}
+
+send_alert() {
+    echo "$(date +"%Y/%m/%d %H:%M:%S") ${1^} : $2"
+    /usr/bin/alert --priority ${priorities[$1]} --title "RClone backup" --id rclone_$3 --timeout $4 "$2"
+}
+
+send_msg() {
+    echo "$(date +"%Y/%m/%d %H:%M:%S") Info : $1"
+}
+
+do_user() {
+    local user=$1
+    shift
+    
+    if which sudo &>/dev/null; then
+        sudo -u $user -- "$@"
+    
+    else
+        su -l $user -c "$(printf '%q ' "$@")"
+    fi
+}
+
+###
+#
+#
+for volume in $(zfs list -o name -H -d 0); do
+    for dataset in $(get_prop_all name rclone:sync.do_$timer $volume); do
+        if [ $(get_prop value rclone:sync $dataset) -eq 1 ]; then
+            if is_mounted $dataset; then
+                operation="$(get_prop value rclone:sync.do_$timer $dataset)"
+                mount="$(get_prop value mountpoint $dataset)"
+                path="$(get_prop value rclone:sync.path $dataset)"
+                user="$(get_prop value rclone:sync.user $dataset)"
+                
+                if [ ! -f "$mount/.rclone" ]; then
+                    send_alert "critical" "Rclone failed due to possible disk falure. Missing sanity check file on dataset '$dataset'" $dataset 86400; continue
+                    
+                elif [[ -z "$user" || ! -f "$(grep "$user:" /etc/passwd | awk -F: '{print $6}')/.config/rclone/rclone.conf" ]]; then
+                    send_alert "critical" "Rclone failed due to invalid user or missing 'rclone.conf' for dataset '$dataset'" $dataset 86400; continue
+                    
+                elif [ -z "$path" ] || ! grep -q "\[$(awk -F: '{print $1}' <<< "$path")\]" "$(grep "$user:" /etc/passwd | awk -F: '{print $6}')/.config/rclone/rclone.conf"; then
+                    send_alert "critical" "Rclone failed due to missing target path for dataset '$dataset'" $dataset 86400; continue
+                
+                elif [[ "$operation" == "sync" ]]; then
+                    send_msg "Running rclone sync operation on dataset '$dataset'"
+                    
+                    for ((i=2; i >= 0; i--)); do
+                        do_user $user rclone --log-level INFO --links sync "$mount/" "$path" --delete-before
+
+                        if [ $? -ne 0 ]; then
+                            if [ $i -eq 0 ]; then
+                                send_alert "error" "Rclone failed to sync dataset '$dataset'" $dataset 900; continue 2
+                                  
+                            else
+                                send_msg "Sync operation failed, retrying in 20s..."; sleep 20s
+                            fi
+                            
+                        else
+                            break
+                        fi
+                    done
+                
+                elif [[ "$operation" == "copy" ]]; then
+                    send_msg "Running rclone copy operation on dataset '$dataset'"
+                    
+                    for ((i=2; i >= 0; i--)); do
+                        do_user $user rclone --log-level INFO --links copy "$mount/" "$path"
+
+                        if [ $? -ne 0 ]; then
+                            if [ $i -eq 0 ]; then
+                                send_alert "error" "Rclone failed to copy dataset '$dataset'" $dataset 900; continue 2
+                                  
+                            else
+                                send_msg "Copy operation failed, retrying in 20s..."; sleep 20s
+                            fi
+                            
+                        else
+                            break
+                        fi
+                    done
+                    
+                else
+                     send_alert "warning" "Rclone failed due to unknown operation '$operation' on dataset '$dataset'" $dataset 86400; continue
+                fi
+            
+            else
+                send_alert "warning" "Rclone failed due to '$dataset' not being mounted" $dataset 86400; continue
+            fi
+            
+            /usr/bin/alert --id rclone_$3 --timeout reset
+        fi
+    done
+done
+

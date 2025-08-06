@@ -1,0 +1,57 @@
+# Ensure official Docker completion is loaded first
+if ! declare -f __start_docker >/dev/null; then
+    source <(command docker completion bash)
+fi
+
+# Rename the original __start_docker()
+if ! declare -f __start_docker_original >/dev/null; then
+    eval "$(declare -f __start_docker | sed 's/__start_docker/__start_docker_original/')"
+fi
+
+# Function to list running container names
+__docker_list_running_containers() {
+  command docker ps --format '{{.Names}}'
+}
+
+# Extend Docker's completion dispatcher
+__start_docker() {
+  local cur prev words cword
+  _init_completion || return
+
+  # Add custom subcommands to top-level
+  if [[ $cword -eq 1 ]]; then
+    local custom_cmds="scan ls netshoot info make"
+    local default_cmds="$(__docker_list_commands)"
+    COMPREPLY=( $(compgen -W "$default_cmds $custom_cmds" -- "$cur") )
+    return
+  fi
+
+  case "${words[1]}" in
+    netshoot)
+      # Suggest running container names
+      if [[ $cword -eq 2 ]]; then
+        COMPREPLY=( $(compgen -W "$(__docker_list_running_containers)" -- "$cur") )
+      fi
+      return
+      ;;
+    info)
+      # Suggest running container names if argument expected
+      if [[ $cword -eq 2 ]]; then
+        COMPREPLY=( $(compgen -W "$(__docker_list_running_containers)" -- "$cur") )
+      fi
+      return
+      ;;
+    scan|ls)
+      # No further arguments
+      return
+      ;;
+  esac
+
+  # Fallback to official Docker logic
+  __start_docker_original "$@"
+}
+
+# Helper: get original docker commands (improves Tab UI)
+__docker_list_commands() {
+  command docker --help | awk '/Commands:/,/^$/ { if ($1 != "Commands:" && $1 != "") print $1 }'
+}

@@ -1,0 +1,191 @@
+#!/bin/bash
+
+declare CACHE
+declare -i show_human=0
+declare show_type
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --help)
+            printf "Usage: %s [-h] [--type <mem|swap>]\n\n" "${0##*/}"
+            printf "Options:\n"
+            printf "  --human,  -h     Print human readable values\n"
+            printf "  --type <type>    Only display memory or swap\n"
+            
+            exit 0
+        ;;
+        
+        -[a-zA-Z]*)  # Short options, possibly combined
+            opts="${1:1}"
+            for ((i=0; i<${#opts}; i++)); do
+                case "${opts:$i:1}" in
+                    h) show_human=1 ;;
+                    *) echo "Unknown option: -${opts:$i:1}" >&2; exit 1 ;;
+                esac
+            done
+        ;;
+        --human) show_human=1;;
+        --type) 
+            shift
+            
+            show_type=$1
+            
+            if [[ "$show_type" != "swap" && "$show_type" != "mem" ]]; then
+                echo "Valid type is 'mem' and 'swap'" >&2; exit 1
+            fi
+        ;;
+        
+        --) shift; break ;;  # Stop option parsing
+        *) echo "Unknown argument: $1" >&2; exit 1 ;;
+    esac
+    
+    shift
+done
+
+# Add new row to the output cache
+row() {
+    local i=0
+
+    while [[ $# -gt 0 ]]; do
+        if [[ $i > 0 ]]; then
+            CACHE+="\t"
+        fi
+    
+        CACHE+="$1"
+        
+        ((i++))
+        shift
+    done
+    
+    CACHE+="\n"
+}
+
+# Convert bytes into human-readable units safely using awk
+scale_unit() {
+    awk -v b="$1" '
+    function unit(v,u) {
+        if (v < 1024) return v "b";
+        v /= 1024;
+        u[1]="Ki"; u[2]="Mi"; u[3]="Gi"; u[4]="Ti";
+        for (i=1; i<=4; i++) {
+            if (v < 1024 || i == 4) return sprintf("%.1f%s", v, u[i]);
+            v /= 1024;
+        }
+    }
+    BEGIN { print unit(b) }
+    '
+}
+
+###
+#
+#
+if [[ -z "$show_type" || "$show_type" == "mem" ]]; then
+    while read -r line; do
+        type=$(awk '{print $1}' <<< "$line")
+        val=$(awk '{print $2}' <<< "$line")
+
+        case "$type" in
+            "MemTotal:") memTotal=$val ;;
+            "MemFree:") memFree=$val ;;
+            "Buffers:") memBuffered=$val ;;
+            "Cached:") memCached=$val ;;
+            
+            *)
+                if [[ -n "$memTotal" && -n "$memFree" && -n "$memBuffered" && -n "$memCached" ]]; then
+                    break
+                fi
+            ;;
+        esac
+    done < <(cat /proc/meminfo)
+
+    memTotal=$(( $memTotal * 1024 ))
+    memAvail=$(( $memFree * 1024 ))
+    memBuff=$(( ($memBuffered + $memCached) * 1024 ))
+    memUsed=$(( $memTotal - $memAvail - memBuff ))
+    
+    if [[ $show_human -eq 1 ]]; then 
+        memTotal=$(scale_unit $memTotal)
+        memAvail=$(scale_unit $memAvail)
+        memUsed=$(scale_unit $memUsed)
+        memBuff=$(scale_unit $memBuff)
+    fi
+
+    if [[ -n "$show_type" ]]; then
+        row "" "Size" "Used" "Buffered" "Free"
+        row "Memory:" "$memTotal" "$memUsed" "$memBuff" "$memAvail"
+        
+        echo -e "$CACHE" | column -t -s $'\t' -R 2,3,4
+    
+    else
+        printf "System Memory\n\n"
+        row "  Total:" "$memTotal"
+        row "  Used:" "$memUsed"
+        row "  Buffered:" "$memBuff"
+        row "  Free:" "$memAvail"
+        
+        echo -e "$CACHE" | column -t -s $'\t' -R 2
+    fi
+    
+    CACHE=
+fi
+
+###
+#
+#
+if [[ -z "$show_type" || "$show_type" == "swap" ]]; then
+    if grep -q '^/' /proc/swaps; then
+        if [[ -n "$show_type" ]]; then
+            row "Swap Device" "Size" "Used" "Free"
+        
+        else
+            printf "\n"
+            row "  Swap Device" "Size" "Used" "Free"
+        fi
+        
+        totalSwapTotal=0
+        totalSwapAvail=0
+        totalSwapUsed=0
+        totalSwaps=0
+
+        while read -r line; do
+            swapDev="$(awk '{print $1}' <<< "$line")"
+            swapTotal=$(( $(awk '{print $3}' <<< "$line") * 1024 ))
+            swapUsed=$(( $(awk '{print $4}' <<< "$line") * 1024 ))
+            swapAvail=$(( $swapTotal - $swapUsed ))
+            
+            totalSwapTotal=$(( $totalSwapTotal + $swapTotal ))
+            totalSwapAvail=$(( $totalSwapAvail + $swapAvail ))
+            totalSwapUsed=$(( $totalSwapUsed + $swapUsed ))
+            ((totalSwaps++))
+            
+            if [[ $show_human -eq 1 ]]; then 
+                swapTotal=$(scale_unit $swapTotal)
+                swapAvail=$(scale_unit $swapAvail)
+                swapUsed=$(scale_unit $swapUsed)
+            fi
+            
+            if [[ -z "$show_type" ]]; then
+                swapDev="  $swapDev"
+            fi
+            
+            row "$swapDev" "$swapTotal" "$swapUsed" "$swapAvail"
+        
+        done < <(cat /proc/swaps | tail -n +2)
+        
+        if [[ -z "$show_type" && $totalSwaps -gt 1 ]]; then
+            if [[ $show_human -eq 1 ]]; then 
+                totalSwapTotal=$(scale_unit $totalSwapTotal)
+                totalSwapAvail=$(scale_unit $totalSwapAvail)
+                totalSwapUsed=$(scale_unit $totalSwapUsed)
+            fi
+            
+            row "" "--------" "--------" "--------"
+            row "" "$totalSwapTotal" "$totalSwapUsed" "$totalSwapAvail"
+        fi
+        
+        echo -e "$CACHE" | column -t -s $'\t' -R 2,3,4
+    fi
+    
+    CACHE=
+fi
+

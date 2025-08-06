@@ -1,0 +1,111 @@
+#!/bin/bash
+#
+# Calculate the system runtime.
+# This does not include time spent in sleep mode like uptime does.
+#
+
+declare -a out_text out_len=(0 0 0 0 0 0 0)
+
+output_flush() {
+	local i x y len rep
+
+	for (( x=0; x < ${#out_text[@]}; x++ )); do
+		i=$(($x % 7))
+		
+		if [ $i -eq 6 ]; then
+			echo "${out_text[$x]}"
+		
+		else
+			len=$(echo -n "${out_text[$x]}" | wc -c)
+			rep=""
+
+			for (( y=0; y < $((${out_len[$i]} - $len)); y++ )); do
+				rep+=" "
+			done
+			
+			if [ $i -eq 0 ]; then
+				echo -n "${out_text[$x]}${rep}  "
+			
+			elif [ $(($i % 2)) -eq 0 ]; then
+				echo -n "${out_text[$x]},${rep} "
+			
+			else
+				echo -n "${rep}${out_text[$x]} "
+			fi
+		fi
+	done
+}
+
+output_add() {
+	local i=0 len
+
+	for arg in "$@"; do
+		len=$(echo -n "$arg" | wc -c)
+		
+		if [ $len -gt ${out_len[$i]} ]; then
+			out_len[$i]=$len
+		fi
+
+		out_text+=("$arg")
+		i=$(($i + 1))
+	done
+}
+
+output_add_stats() {
+    local -i stamp="${2:-0}"
+    local -i days=$(($stamp / 86400))
+    local -i hours=$(($stamp % 86400 / 3600))
+    local -i minutes=$(($stamp % 3600 / 60))
+    
+    output_add "$1:" \
+        $days $(test $days -ne 1 && echo "days" || echo "day") \
+        $hours $(test $hours -ne 1 && echo "hours" || echo "hour") \
+        $minutes $(test $minutes -ne 1 && echo "minutes" || echo "minute")
+}
+
+timediff() {
+    local from="${1:-now}"
+    local to="${2:-now}"
+    
+    from=$(date --date="$from" +%s)
+    to=$(date --date="$to" +%s)
+    
+    echo $(($to - $from))
+}
+
+declare last_boot=$(journalctl -r -n1 -u sysinit.target -o short-iso | grep -oe '[0-9-]\+T[0-9:]\++[0-9]\+')
+
+if [ -z "$last_boot" ]; then
+    echo "Could not find last boot records" >&2; exit 1
+fi
+
+declare last_resume=$(journalctl -r -n1 -u sleep.target -o short-iso --since "$(date --date=$last_boot +'%Y-%m-%d %H:%M:%S')" | grep -oe '[0-9-]\+T[0-9:]\++[0-9]\+')
+declare last current 
+declare -i uptime=$(timediff $last_boot) 
+declare -i runtime=$uptime
+
+while read line; do
+    current=$(echo "$line" | grep -oe '[0-9-]\+T[0-9:]\++[0-9]\+')
+
+    if [ -n "$current" ]; then
+        if grep -q 'Reached' <<< "$line"; then
+            last=$current
+        
+        elif grep -q 'Stopped' <<< "$line"; then
+            runtime=$(($runtime - $(timediff $last $current)))
+        fi
+    fi
+
+done < <(journalctl -u sleep.target -o short-iso --since "$(date --date=$last_boot +'%Y-%m-%d %H:%M:%S')")
+
+output_add_stats "Uptime" $uptime
+output_add_stats "Runtime" $runtime
+output_add_stats "Sleep" $(($uptime - $runtime))
+output_flush
+
+printf '\nLast boot at %s\n' "$(date --date=$last_boot +'%Y-%m-%d %H:%M:%S')"
+
+if [ -n "$last_resume" ]; then
+    printf 'Last resume at %s\n' "$(date --date=$last_resume +'%Y-%m-%d %H:%M:%S')"
+fi
+

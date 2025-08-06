@@ -1,0 +1,186 @@
+#!/bin/bash
+#
+# Simple alert file that scripts can use to send status updates. 
+# Having this in it's own separate file allows you to switch
+# the message mechanism without having to go though each script.
+#
+# Requires configuration file '/etc/alert.conf' that should contain 
+# server addresses, one address per line. 
+#
+# Currently this script is compatible with the Gotify notification service.
+#
+###
+#
+# alert --id <id> --title <head> --priority <low,medium,...> --timeout <[0-9]+|reset> <body>
+#
+
+declare -i ret=0
+declare id title priority=medium message timeout="-1"
+declare cache_home=/tmp/alert
+declare alert_conf=/etc/alert.conf
+declare -a servers
+declare -A priorities=(
+    ["low"]=0 
+    ["medium"]=3 
+    ["high"]=7 
+    ["critical"]=10
+)
+
+if [ ! -d "$cache_home" ]; then
+    mkdir -p "$cache_home"
+    
+    if [ ! -d "$cache_home" ]; then
+        echo "Failed to create cache directory" >&2; exit 1
+    fi
+fi
+
+if ! which curl >/dev/null 2>&1; then
+    echo "Missing the 'curl' program" >&2; exit 1
+
+elif [ ! -f "$alert_conf" ]; then
+    echo "Missing the config file '$alert_conf'" >&2; exit 1
+fi
+
+while read line; do
+    property=$(awk -F '=' '{gsub(/^[ \t]+|[ \t]+$/, "", $1); print $1}' <<< "$line")
+    value=$(awk -F '=' '{sub(/^[[:space:]]+/, "", $2); for(i=2;i<=NF;i++) printf "%s%s", (i==2 ? "" : "="), $i; printf "\n"}' <<< "$line")
+    
+    if [ "$property" = "server" ]; then
+        servers+=("$value")
+    fi
+
+done < <(grep -ve '^[ \t]*#' "$alert_conf" | grep -ve '^[ \t]*$')
+
+if [ -z "${servers[*]}" ]; then
+    echo "There are no target servers configured" >&2; exit 1
+fi
+
+while true; do
+    if [ -n "$1" ]; then
+        case "${1::1}" in
+            "-")
+                case "${1:2}" in
+                    id)
+                        shift
+                        id=$(md5sum <<< "$1" | awk '{print $1}')
+                    ;;
+                    
+                    title)
+                        shift
+                        title="$1"
+                    ;;
+                    
+                    priority)
+                        shift
+                        priority=$1
+                        
+                        if ! grep -qe '^\(low\|medium\|high\|critical\)$' <<< "$priority"; then
+                            echo "Invalid priority '$priority'" >&2; exit 1
+                        fi
+                    ;;
+                    
+                    timeout)
+                        shift
+                        timeout=$1
+                        
+                        if ! grep -qe '^\([0-9]\+\|reset\)$' <<< "$timeout"; then
+                            echo "Invalid timeout '$timeout'" >&2; exit 1
+                        fi
+                    ;;
+                    
+                    *)
+                        echo "Unknown option '$1'" >&2; exit 1
+                    ;;
+                esac
+            ;;
+            
+            *)
+                if [ -z "$message" ]; then
+                    message="$1"
+                
+                else
+                    echo "Invalid argument length" >&2; exit 1
+                fi
+            ;;
+        esac
+    
+    else
+        break
+    fi
+    
+    shift
+done
+
+if [ -z "$id" ]; then
+    id=$(md5sum <<< "${priority}${title}${message}" | awk '{print $1}')
+fi
+
+###
+#
+#
+for url in "${servers[@]}"; do
+    declare server_hash=$(md5sum <<< "$url" | awk '{print $1}')
+    
+    if ! grep -qe '^\(-1\|reset\)$' <<< "$timeout"; then
+        if [[ -f "$cache_home/$id" ]] && grep -q "$server_hash" "$cache_home/$id"; then
+            if [[ $timeout -eq 0 || $(bc -s <<< "$(date +%s) - $timeout - $(grep -e "^$server_hash" "$cache_home/$id" | awk '{print $2}')") -lt 0 ]]; then
+                continue
+            fi
+        fi
+        
+    elif [[ "$timeout" == "reset" ]]; then
+        if ! [ -f "$cache_home/$id" ] || ! grep -q "$server_hash" "$cache_home/$id"; then
+            continue
+        fi
+    fi
+    
+    if [ -n "$message" ]; then
+        declare opt=(
+            "$url"
+            "-F"
+            "message=$message"
+            "-F"
+            "priority=${priorities[$priority]}"
+        )
+        
+        if [[ -n "$title" ]]; then
+            opt+=( "-F" "title=$title" )
+        fi
+        
+        echo -n "Sending alert to '$(grep -oe '^\(http\(s\)\?://\)\?[^/]\+' <<< "$url")': "
+        output="$(curl "${opt[@]}" 2>/dev/null)"
+        
+        if [[ $? -ne 0 || $(grep -qe '"error":' <<< "$output") ]]; then
+            echo "[Failed]"
+            ret=1
+            
+        else
+            echo "[OK]"
+        fi
+        
+        unset opt
+    fi
+    
+    if [ $ret -eq 0 ]; then
+        if [[ -f "$cache_home/$id" ]]; then
+            sed -i "/^$server_hash/d" "$cache_home/$id"
+        fi
+        
+        if ! grep -qe '^\(-1\|reset\)$' <<< "$timeout"; then
+            echo "$server_hash $(date +%s)" >> "$cache_home/$id"
+        
+        elif [[ -f "$cache_home/$id" && -z "$(cat "$cache_home/$id")" ]]; then
+            rm "$cache_home/$id"
+        fi
+    fi
+done
+
+###
+#
+#
+if [ $ret -ne 0 ]; then
+    echo "Failed to send the alert message to all servers" >&2
+fi
+
+exit $ret
+

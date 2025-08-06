@@ -1,0 +1,215 @@
+#!/bin/bash
+#
+# Script to output all available thermal probes on a system without installing
+# additional monitoring tools. 
+#
+
+declare OPT_CHIP CACHE
+declare -i OPT_HUMAN=0
+declare -i OPT_MEDIAN=0
+declare -i STAT=1
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --help)
+            printf "Usage: %s [-hm] [CHIP]\n\n" "${0##*/}"
+            printf "Options:\n"
+            printf "  --human,  -h    Print human readable values\n"
+            printf "  --median, -m    Return the median of all values within a chip\n"
+            
+            exit 0
+        ;;
+        -[a-zA-Z]*)  # Short options, possibly combined
+            opts="${1:1}"
+            for ((i=0; i<${#opts}; i++)); do
+                case "${opts:$i:1}" in
+                    h) OPT_HUMAN=1 ;;
+                    m) OPT_MEDIAN=1 ;;
+                    *) echo "Unknown option: -${opts:$i:1}" >&2; exit 1 ;;
+                esac
+            done
+        ;;
+        --human) OPT_HUMAN=1;;
+        --median) OPT_MEDIAN=1;;
+        
+        --) shift; break ;;  # Stop option parsing
+        *) 
+            if [[ -n "$OPT_CHIP" ]]; then
+                echo "Unknown argument: $1" >&2; exit 1
+            fi
+            
+            OPT_CHIP="$1"
+        ;;
+    esac
+    
+    shift
+done
+
+if [[ -n "$1" ]]; then
+    OPT_CHIP="$1"
+fi
+
+# Add new row to the output cache
+row() {
+    local i=0
+
+    while [[ $# -gt 0 ]]; do
+        if [[ $i > 0 ]]; then
+            CACHE+="\t"
+        fi
+    
+        CACHE+="$1"
+        
+        ((i++))
+        shift
+    done
+    
+    CACHE+="\n"
+}
+
+###
+#
+#
+scale_unit() {
+    awk '{printf "%.1f°C", $1/1000}' <<< "$1"
+}
+
+###
+# * On Intel and older AMD platforms, type will equal "x86_pkg_temp"
+# * On some platforms like Raspberry Pi's, type will equal "cpu_thermal"
+# 
+# Not all platforms has "/sys/class/thermal/" such as newer AMD platforms. 
+#
+if ls /sys/class/thermal/thermal_zone*/temp >/dev/null 2>&1; then
+    if [[ -z "$OPT_CHIP" || "$OPT_CHIP" == "thermal-zone" ]]; then
+        if [[ -z "$OPT_CHIP" ]]; then
+            row "Virtual" 
+            row "  thermal-zone" 
+        fi
+            
+        if [[ -n "$OPT_CHIP" && $OPT_MEDIAN -gt 0 ]]; then
+            TEMP=0
+            MED=0
+            
+            for zone in /sys/class/thermal/thermal_zone*; do
+                if [ -d $zone ]; then
+                    STAT=0
+                    TEMP=$(( $TEMP + $(cat $zone/temp) ))
+                    ((MED++))
+                fi
+            done
+            
+            if [[ $MED -gt 0 ]]; then
+                TEMP=$(( $TEMP / $MED ))
+            fi
+            
+            if [[ $OPT_HUMAN -eq 1 ]]; then
+                echo $(scale_unit $TEMP)
+            
+            else
+                echo $TEMP
+            fi
+        
+        else
+            for zone in /sys/class/thermal/thermal_zone*; do
+                if [ -d $zone ]; then
+                    STAT=0
+                    
+                    type="$(cat $zone/type)"
+                    temp="$(cat $zone/temp)"
+                    
+                    if [[ $OPT_HUMAN -eq 1 ]]; then
+                        temp="$(scale_unit $temp)"
+                    fi
+                    
+                    if [[ -z "$OPT_CHIP" ]]; then
+                        row "    * $type:" "$temp"
+                        
+                    else
+                        row "$type:" "$temp"
+                    fi
+                fi
+            done
+        fi
+
+        if [[ -z "$OPT_CHIP" ]]; then
+            row ""
+        fi
+    fi
+fi
+
+###
+# Newer AMD and Intel platforms use "/sys/class/hwmon/", though many Intel still has "/sys/class/thermal/"
+# for compatibility, but it will reflect the values within "/sys/class/hwmon/".
+#
+# * On Intel the chip will equal "coretemp" and it will use the first "temp*_input" file as the main CPU temp
+#   under the label "Package id 0", but this is not consistent. For an example some Xeon processors (possibly others to)
+#   only have the various core temps without a specific main temperature. 
+#   The following "temp*_input" files will be for each core. 
+#
+# * On AMD the chip will equal "k10temp" and the "temp*_label" for the monitoring temp will be "Tctl" while 
+#   the actual die will use "Tccd1". However larger CPU's may have muliple "Tccd<x>" dies, so checking "Tctl"
+#   if the preferred way, as this is what is used to control fans and other things. 
+#
+if ls /sys/class/hwmon/hwmon*/temp*_input >/dev/null 2>&1; then
+    [[ -z "$OPT_CHIP" ]] && row "HWMon" 
+
+    for hwmon in /sys/class/hwmon/hwmon*; do
+        if ls $hwmon/temp*_input >/dev/null 2>&1; then
+            chip=$(cat $hwmon/name 2>/dev/null)
+            
+            if [[ -z "$OPT_CHIP" || "$OPT_CHIP" == "$chip" ]]; then
+                [[ -z "$OPT_CHIP" ]] && row "  $chip" 
+                
+                if [[ -n "$OPT_CHIP" && $OPT_MEDIAN -gt 0 ]]; then
+                    TEMP=0
+                    MED=0
+                    
+                    for input in $hwmon/temp*_input; do
+                        STAT=0
+                        TEMP=$(( $TEMP + $(cat $input) ))
+                        ((MED++))
+                    done
+                    
+                    if [[ $MED -gt 0 ]]; then
+                        TEMP=$(( $TEMP / $MED ))
+                    fi
+                    
+                    if [[ $OPT_HUMAN -eq 1 ]]; then
+                        echo $(scale_unit $TEMP)
+                    
+                    else
+                        echo $TEMP
+                    fi
+                
+                else
+                    for input in $hwmon/temp*_input; do
+                        STAT=0
+                        
+                        temp="$(cat $input)"
+                        label="$(echo "$input" | sed 's/_input$/_label/')"
+                        [ -f "$label" ] && name=$(cat "$label") || name=$(basename "$input" | sed 's/_input$//')
+                        
+                        if [[ $OPT_HUMAN -eq 1 ]]; then
+                            temp="$(scale_unit $temp)"
+                        fi
+                        
+                        if [[ -z "$OPT_CHIP" ]]; then
+                            row "    * $name:" "$temp"
+                            
+                        else
+                            row "$name:" "$temp"
+                        fi
+                    done
+                fi
+            fi
+        fi
+    done
+fi
+
+if [[ -n "$CACHE" ]]; then
+    echo -e "$CACHE" | column -t -s $'\t' -R 2 -L
+fi
+
+exit $STAT
+

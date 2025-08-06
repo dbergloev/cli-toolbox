@@ -1,0 +1,55 @@
+#!/bin/bash
+#
+# There are a few rules for the 2 least significant bits of the first byte of a mac address. 
+# 
+#   * 0000000[0] = Unicast
+#   * 0000000[1] = Multicast
+#   * 000000[0]0 = Universally Administered
+#   * 000000[1]0 = Locally Administered
+#
+
+declare opt_universal=0
+declare opt_multicast=0
+
+for arg in "$@"; do
+    if [[ "$arg" == "-h" || "$arg" == "--help" ]]; then
+        printf "Usage: %s [-um]\n\n" "${0##*/}"
+        printf "Options:\n"
+        printf "  -u    Make Universally Administered address (bit 1)\n"
+        printf "  -m    Make Multicast address (bit 0)\n\n"
+        printf " * Default is a Locally Administered Unicast address\n"
+        
+        exit 0
+    
+    elif [[ "$arg" =~ ^-([um]{1,2})$ ]]; then
+        [[ "$arg" == *u* ]] && opt_universal=1
+        [[ "$arg" == *m* ]] && opt_multicast=1
+        
+    else
+        echo "Invalid argument: $arg" >&2
+        exit 1
+    fi
+done
+
+# Default Locally Administered Unicast
+primary=$((RANDOM % 256 & 0xFE | 0x02))
+
+if [ $opt_universal -gt 0 ]; then
+    primary=$(($primary & 0xFD))
+fi
+
+if [ $opt_multicast -gt 0 ]; then
+    primary=$(($primary | 0x01))
+fi
+
+# Generate a MAC address that starts with 02:
+mac=$(printf '%02x:%02x:%02x:%02x:%02x:%02x\n' \
+  $primary \
+  $((RANDOM % 256)) \
+  $((RANDOM % 256)) \
+  $((RANDOM % 256)) \
+  $((RANDOM % 256)) \
+  $((RANDOM % 256)))
+
+echo "$mac"
+
