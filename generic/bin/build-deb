@@ -1,0 +1,211 @@
+#!/bin/bash
+
+declare op_dry=0
+
+if [[ "$1" == "-h" || "$1" == "--help" ]]; then
+    printf "Usage: %s <path>\n\n" "${0##*/}"
+    printf "The <path> must be a header file or the directory containing such a file.\n"
+    printf "This file should contain the files to pack as well as any permissions and ownership.\n\n"
+    printf "Header File:\n"
+    printf "  FILE <SRC> <DST>\n"
+    printf "  PERM <mod> <DST>\n"
+    printf "  OWNER <usr>[:<grp>] <DST>\n\n"
+    printf "It is allowed to use glob like /some/*/path/file*.ext\n"
+    printf "You can wrap paths in quotes to avoid issues with paths containing whitespaces.\n"
+    
+    exit 0
+    
+elif [[ "$1" == "-d" ]]; then
+    # Not really a dry run.
+    # We have to build in order to test, but this makes sure not to leave any files behind.
+    op_dry=1
+    shift
+fi
+
+# Return value from expand_path()
+declare -a expand_match
+
+###
+# Resolve glob paths: /etc/*/myconf*.ini into an array of matches
+#
+expand_path() {
+    local ong="$(shopt -p nullglob)"
+    local ogs="$(shopt -p globstar)"
+    local oifs=$IFS
+    local pattern="$1"
+    
+    # Make sure paths does not break on whitespace
+    IFS=$'\n'
+    
+    # Configure glob handling
+    shopt -s nullglob
+    shopt -s globstar
+    
+    # Resolve possible glob pattern
+    mapfile -d '' expand_match < <(printf '%s\0' $pattern)
+    
+    # Reset shell settings
+    IFS=$oifs
+    $ong
+    $ogs
+}
+
+###
+# Resolve a path relative to another
+#
+resolve_path() {
+    local path="$2"
+
+    if ! grep -qE '^/' <<< "$path"; then
+        path="$(realpath -m "${1%/}/$path")"
+    fi
+    
+    echo "$path"
+}
+
+###
+# Print and quit
+#
+die() {
+    echo "$1" >&2
+    exit 1
+}
+
+###
+# Check environment
+#
+for cmd in dpkg-deb fakeroot; do
+    if ! which $cmd >/dev/null 2>&1; then
+        die "Missing binary $cmd"
+    fi
+done
+
+###
+# Prepare build requirements
+#
+declare srcHeader="$(realpath -m "${1:-$(pwd)}")"
+
+if [[ -d "$srcHeader" ]]; then
+    srcHeader="$srcHeader/header"
+fi
+
+[[ -f "$srcHeader" ]] || die "Missing header file"
+
+declare srcPath="$(dirname "$srcHeader")"
+declare dstBase=$(mktemp -d)
+
+[[ -f "$srcPath/control" ]] || die "Missing control file"
+
+if [ ! -d $dstBase ]; then
+    die "Failed to create temp directory $dstBase"
+fi
+
+mkdir $dstBase/DEBIAN
+
+declare pkgVer=$(grep '^Version:' "$srcPath/control" | cut -d' ' -f2)
+declare pkgName=$(grep '^Package:' "$srcPath/control" | cut -d' ' -f2)
+declare pkgArch=$(grep '^Architecture:' "$srcPath/control" | cut -d' ' -f2)
+
+###
+# Copy requires files
+#
+for file in control preinst postinst prerm postrm; do
+    if [[ -f "$srcPath/$file" ]]; then
+        printf "Copy %s -> %s\n" "$srcPath/$file" "DEBIAN/"
+        cp "$srcPath/$file" $dstBase/DEBIAN/$file
+        chmod 0775 "$srcPath/$file" $dstBase/DEBIAN/$file
+    fi
+done
+
+# It's faster just to fix it after
+chmod 0644 $dstBase/DEBIAN/control
+
+###
+# Deal with package files
+#
+declare ownership
+
+for type in FILE PERM OWNER; do
+    while IFS= read -r line; do
+        # Use `eval` to expand quoting like a shell would
+        set -f # Disable globbing
+        eval "set -- $line"
+        set +f # Re-enable globbing
+    
+        case "$type" in
+            FILE) 
+                src="$1"
+                dst="$2"
+            ;;
+            
+            *) 
+                mod="$1"
+                dst="$2"
+            ;;
+        esac
+        
+        dst="$dstBase/$(sed 's/^\///' <<< "$dst")"
+        
+        case "$type" in
+            FILE) 
+                expand_path "$(resolve_path "$srcPath" "$src")" 
+            ;;
+            *) expand_path "$dst" ;;
+        esac
+        
+        for file in "${expand_match[@]}"; do
+            case "$type" in
+                FILE)
+                    printf "Copy %s -> %s\n" "${file#$src}" "${dst#$dstBase}"
+                    
+                    if [[ $dst == */ ]]; then
+                        mkdir -p "$dst"
+                    else
+                        mkdir -p "$(dirname "$dst")"
+                    fi
+                    
+                    if [[ -d "$file" ]]; then
+                        cp -a "$file" "$dst"
+                    else
+                        cp "$file" "$dst"
+                    fi
+                ;;
+                
+                PERM)
+                    printf "Set Mod '%s' -> %s\n" "$mod" "${file#$dstBase}"
+                    chmod $mod "$file"
+                ;;
+                
+                OWNER)
+                    printf "Set Owner '%s' -> %s\n" "$mod" "${file#$dstBase}"
+                    ownership+="chown $mod \"$file\"\n"
+                ;;
+            esac
+        done
+        
+    done < <(cat $srcHeader | awk -v prefix="$type" '$1 == prefix { $1=""; print }')
+done 
+
+###
+# Build package
+#
+if [[ -z "$dstBase" ]]; then
+    die "Something went wrong"
+fi
+
+fakeroot bash -c "
+    chmod -R a-s $dstBase/
+    chown -R root:root $dstBase/DEBIAN
+    $(echo -e "$ownership")
+    dpkg-deb --build $dstBase "$srcPath/${pkgName}_${pkgVer}_${pkgArch}.deb"
+"
+
+if [[ $op_dry -eq 1 ]]; then
+    rm "$srcPath/${pkgName}_${pkgVer}_${pkgArch}.deb"
+fi
+
+###
+# Cleaning up
+#
+rm -rf $dstBase
+
