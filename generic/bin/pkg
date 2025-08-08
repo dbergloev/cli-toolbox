@@ -1,0 +1,350 @@
+#!/bin/bash
+
+#!/bin/bash
+#
+# A wrapper for package management that unifies how packages
+# are managed across various systems.
+#
+set -e
+
+declare version=1.0.0
+declare C_GRE C_TON C_SOT C_CLR
+declare cmd="$1" pkg
+declare -a sudoer=("refresh" "update" "install", "remove", "clean")
+declare -i opt_simple=0 opt_installed=0 opt_match=0 opt_force=0 opt_reinstall
+
+##
+#
+#
+if [[ " ${sudoer[*]} " =~ " $cmd " && $(id -u) -ne 0 ]]; then
+    exec sudo "$0" "$cmd" "${argv[@]}"
+fi
+
+##
+#
+#
+if which tput >/dev/null 2>&1 && [ `tput colors` -gt 8 ]; then
+    C_GRE="$(tput setaf 2)"
+    C_TON="$(tput setaf 7)"
+    C_SOT="$(tput smso)"
+    C_CLR="$(tput sgr0)"
+fi
+
+for n in pacman apt; do
+    if which $n > /dev/null 2>&1; then
+        pkg=$n; break
+    fi
+done
+
+if [[ "$cmd" == "--help" || "$cmd" == "-h" ]]; then
+    printf "Usage: [options] command\n"
+    printf "\n"
+    printf "%sCommands:%s\n" "$C_TON" "$C_CLR"
+    printf "  %ssearch%s %s<PKG>%s - Search for packages\n" "$C_GRE" "$C_CLR" "$C_TON" "$C_CLR"
+    printf "  %sinfo%s %s<PKG>%s - Display details about a package\n" "$C_GRE" "$C_CLR" "$C_TON" "$C_CLR"
+    printf "  %sinstall%s %s<PKG>%s - Install package\n" "$C_GRE" "$C_CLR" "$C_TON" "$C_CLR"
+    printf "  %sremove%s %s<PKG>%s - Uninstall package\n" "$C_GRE" "$C_CLR" "$C_TON" "$C_CLR"
+    printf "  %srefresh%s - Refresh package repositories\n" "$C_GRE" "$C_CLR"
+    printf "  %supdate%s - Update installed packages\n" "$C_GRE" "$C_CLR"
+    printf "  %sclean%s - Remove dangling unused packages\n" "$C_GRE" "$C_CLR"
+    printf "  %sprovides%s - Check which package provides a specific file\n" "$C_GRE" "$C_CLR"
+    printf "\n"
+    printf "%sOptions:%s\n" "$C_TON" "$C_CLR"
+    printf "  %s--installed%s - Search only for installed packages\n" "$C_GRE" "$C_CLR"
+    printf "  %s--simple%s - Print a simple list of search results\n" "$C_GRE" "$C_CLR"
+    printf "  %s--match%s - Match search to package names\n" "$C_GRE" "$C_CLR"
+    printf "  %s--force%s - Force reinstall of select packages\n" "$C_GRE" "$C_CLR"
+    printf "  %s--reinstall%s - Complete reinstall with forced overwrite of any conflicting files (Use with caution)\n" "$C_GRE" "$C_CLR"
+    
+    exit 0
+fi
+
+shift
+while [[ "$1" == -* ]]; do
+        case "$1" in
+        --simple) 
+            opt_simple=1
+            
+            if [[ "$cmd" != "search" ]]; then
+                echo "Invalid option $1 for $cmd" >&2; exit 1 
+            fi
+        ;;
+        
+        --installed) 
+            opt_installed=1 
+            
+            if [[ "$cmd" != "search" ]]; then
+                echo "Invalid option $1 for $cmd" >&2; exit 1 
+            fi
+        ;;
+        
+        --match) 
+            opt_match=1 
+            
+            if [[ "$cmd" != "search" ]]; then
+                echo "Invalid option $1 for $cmd" >&2; exit 1 
+            fi
+        ;;
+        
+        --force) 
+            opt_force=1 
+            
+            if [[ "$cmd" != "install" ]]; then
+                echo "Invalid option $1 for $cmd" >&2; exit 1 
+            fi
+        ;;
+        
+        --reinstall) 
+            opt_reinstall=1 
+            
+            if [[ "$cmd" != "install" ]]; then
+                echo "Invalid option $1 for $cmd" >&2; exit 1 
+            fi
+        ;;
+        
+        --) 
+            shift; break 
+        ;;
+        
+        *) 
+            echo "Unknown option: $1" >&2; exit 1 
+        ;;
+    esac
+    
+    shift
+done
+
+declare -a argv=("$@")
+
+##
+#
+#
+case "$pkg" in
+    apt)
+        case "$cmd" in
+            search)
+                apt-cache search "${argv[@]}" | while IFS= read -r line; do
+                    name=${line%% - *}
+                    desc=${line#* - }
+                    
+                    if [[ $opt_match -eq 1 ]]; then
+                        for word in "${argv[@]}"; do
+                            if [[ "$name" != *"$word"* ]]; then
+                                continue 2
+                            fi
+                        done
+                    fi
+                    
+                    status=$(dpkg -l "$name" 2>/dev/null | awk -v ton="${C_TON}" -v clr="${C_CLR}" '/^ii/ {printf " %sinstalled%s", ton, clr}')
+                    
+                    if [[ $opt_installed -eq 1 && -z "$status" ]]; then
+                        continue
+                    fi
+                    
+                    if [[ $opt_simple -eq 0 ]]; then
+                        info=$(apt-cache show $name 2>/dev/null | awk -F': ' '
+                            /^Architecture:/ {arch=$2}
+                            /^Version:/ && !version {version=$2}
+                            END { print arch, version }
+                        ')
+                        read -r arch ver <<< "$info"
+                        
+                        printf "%s%s%s -%s %s %s\n  %s\n\n" "${C_GRE}" "${name}" "${C_CLR}" "${status}" "${ver}" "${arch}" "${desc}"
+                        
+                    else
+                        printf "%s%s%s - %s\n" "${C_GRE}" "${name}" "${C_CLR}" "${desc}"
+                    fi
+                done
+            ;;
+            
+            info|show)
+                for pkg in "${argv[@]}"; do
+                    status=$(dpkg -l "$pkg" 2>/dev/null | awk '/^ii/ {print "yes"}')
+                    
+                    if [[ "$status" != "yes" ]]; then
+                        status="no"
+                    fi
+                
+                    apt-cache show $pkg \
+                        | grep -vE "^SHA|^MD5|^[^-]+-md5" \
+                        | awk '/^Size: / {v=$2; split("B KiB MiB GiB TiB", u); i=0; while(v>=1024 && i<4) {v/=1024; i++} printf "Size: %.2f %s\n", v, u[i+1]; next} {print}' \
+                        | awk -v stat="$status" '/^Architecture:/ { print; printf "Installed: %s\n", stat; next } { print }' \
+                        | sed "s/^\([^:]\+:\)/${C_TON}\1${C_CLR}/"
+                        
+                    printf "\n"
+                done
+            ;;
+            
+            clean)
+                apt-get autoremove && apt-get autoclean
+            ;;
+            
+            remove)
+                apt-get purge "${argv[@]}"
+            ;;
+            
+            install)
+                if [[ $opt_force -eq 1 ]]; then
+                    apt-get reinstall "${argv[@]}"
+                
+                else
+                    apt-get install "${argv[@]}"
+                fi
+                
+                if [[ $opt_reinstall -eq 1 ]]; then
+                    cwd="$(pwd)"
+                    temp="$(mktemp -d)"
+                    
+                    if [[ ! -d "$temp" ]]; then
+                        echo "Failed to make a complete reinstall" >&2; exit 1
+                    fi
+                    
+                    cd "$temp"
+                    
+                    for pkg in "${argv[@]}"; do
+                        if ! apt-get download "$pkg"; then
+                            echo "Failed to download package: $pkg" >&2
+                            cd "$cwd"
+                            rm -rf "$temp"
+                            exit 1
+                        fi
+
+                        deb_file="$(find . -maxdepth 1 -type f -name "${pkg}_*.deb" | head -n1)"
+                        if [[ -z "$deb_file" ]]; then
+                            echo "Could not find downloaded .deb for $pkg" >&2
+                            cd "$cwd"
+                            rm -rf "$temp"
+                            exit 1
+                        fi
+
+                        dpkg -i --force-confnew "$deb_file"
+                    done
+                    
+                    cd "$cwd"
+                    rm -rf "$temp"
+                fi
+            ;;
+            
+            refresh)
+                apt-get update
+            ;;
+            
+            update)
+                apt-get upgrade
+            ;;
+            
+            provides)
+                dpkg -S "${argv[@]}"
+            ;;
+            
+            *)
+                echo "Missing or invalid command" >&2; exit 1
+            ;;
+        esac
+    ;;
+    
+    pacman)
+        case "$cmd" in
+            search)
+                pacman -Ss "${argv[@]}" | awk '
+                    /^[^ ]+\// {
+                        split($1, a, "/");
+                        repo = a[1];
+                        name = a[2];
+                        version = $2;
+                        next
+                    }
+                    /^  / {
+                        sub(/^[[:space:]]+/, "", $0);
+                        print repo "|" name "|" version "|" $0
+                    }
+                ' | while IFS='|' read -r repo name ver desc; do
+
+                    if [[ $opt_match -eq 1 ]]; then
+                        for word in "${argv[@]}"; do
+                            if [[ "$name" != *"$word"* ]]; then
+                                continue 2
+                            fi
+                        done
+                    fi
+                    
+                    status=
+                    if pacman -Q $name &>/dev/null; then
+                        status=" ${C_TON}installed${C_CLR}"
+                    fi
+                    
+                    if [[ $opt_simple -eq 0 ]]; then
+                        printf "%s%s%s -%s %s %s\n  %s\n\n" "${C_GRE}" "${name}" "${C_CLR}" "${status}" "${ver}" "${repo}" "${desc}"
+                    
+                    else
+                        printf "%s%s%s - %s\n" "${C_GRE}" "${name}" "${C_CLR}" "${desc}"
+                    fi
+                done
+                
+                printf "\n"
+            ;;
+            
+            info|show)
+                for pkg in "${argv[@]}"; do
+                    if pacman -Q $pkg &>/dev/null; then
+                        pacman -Qi $pkg | sed -E "s/^([^[:space:]][^:]*:)/${C_TON}\1${C_CLR}/"
+                    
+                    else
+                        pacman -Si $pkg | sed -E "s/^([^[:space:]][^:]*:)/${C_TON}\1${C_CLR}/"
+                    fi
+                    
+                    printf "\n"
+                done
+            ;;
+            
+            refresh)
+                pacman -Syy
+            ;;
+            
+            update)
+                pacman -Su
+            ;;
+            
+            install)
+                if [[ $opt_reinstall -eq 1 ]]; then
+                    pacman -S --overwrite "${argv[@]}"
+            
+                # With pacman you must explicitly tell it NOT to install packages already installed. 
+                elif [[ $opt_force -eq 1 ]]; then
+                    pacman -S "${argv[@]}"
+                
+                else
+                    pacman -S --needed "${argv[@]}"
+                fi
+            ;;
+            
+            remove)
+                pacman -Rcns "${argv[@]}"
+            ;;
+            
+            clean)
+                list="`pacman -Qdtq`"
+                
+                if [ -n "$list" ]; then
+                    pacman -Rcns $list
+                
+                else
+                    echo "Nothing do to"
+                fi
+            ;;
+            
+            provides)
+                pacman -Qo "${argv[@]}"
+            ;;
+            
+            *)
+                echo "Missing or invalid command" >&2; exit 1
+            ;;
+        esac
+    ;;
+    
+    *)
+        echo "Missing or invalid package manager" >&2; exit 1
+    ;;
+esac
+
