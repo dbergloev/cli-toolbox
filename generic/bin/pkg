@@ -10,7 +10,7 @@ set -e
 declare version=1.0.0
 declare C_GRE C_TON C_SOT C_CLR
 declare cmd="$1" pkg
-declare -a sudoer=("refresh" "update" "install", "remove", "clean")
+declare -a sudoer=("refresh" "update" "install" "remove" "clean")
 declare -i opt_simple=0 opt_installed=0 opt_match=0 opt_force=0 opt_reinstall
 
 ##
