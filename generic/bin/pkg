@@ -240,6 +240,11 @@ case "$pkg" in
             
             refresh)
                 apt-get update
+                count=$(apt-get -s dist-upgrade | awk '/^[0-9]+ upgraded,/ {print $1}')
+                
+                if [[ $count -gt 0 ]]; then
+                    echo -e "\e[1m$count packages can be upgraded. Run 'apt list --upgradable' to see them.\e[0m"
+                fi
             ;;
             
             update)
