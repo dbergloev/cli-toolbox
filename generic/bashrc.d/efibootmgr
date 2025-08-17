@@ -1,0 +1,19 @@
+
+# Provide a much cleaner list of EFI boot entries
+
+###
+#
+#
+efibootmgr() {
+    if [[ "$1" == "ls" || "$1" == "list" ]]; then
+        command efibootmgr | awk '{
+          key = $1
+          sub(/^[^ ]+ +/, "", $0)          # drop the first field + following space
+          printf "%s\t%s\n", key, $0       # join with a TAB
+        }' | column -W 3 -s $'\t' -t
+    
+    else
+        command efibootmgr "$@"
+    fi
+}
+
