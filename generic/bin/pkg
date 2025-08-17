@@ -5,7 +5,7 @@
 # A wrapper for package management that unifies how packages
 # are managed across various systems.
 #
-set -e
+# set -e
 
 declare version=1.0.0
 declare C_GRE C_TON C_SOT C_CLR
@@ -53,7 +53,7 @@ if [[ "$cmd" == "--help" || "$cmd" == "-h" ]]; then
     printf "  %s--installed%s - Search only for installed packages\n" "$C_GRE" "$C_CLR"
     printf "  %s--simple%s - Print a simple list of search results\n" "$C_GRE" "$C_CLR"
     printf "  %s--match%s - Match search to package names\n" "$C_GRE" "$C_CLR"
-    printf "  %s--force%s - Force reinstall of select packages\n" "$C_GRE" "$C_CLR"
+    printf "  %s--force%s - Force reinstall or removal of select packages\n" "$C_GRE" "$C_CLR"
     printf "  %s--reinstall%s - Complete reinstall with forced overwrite of any conflicting files (Use with caution)\n" "$C_GRE" "$C_CLR"
     
     exit 0
@@ -89,7 +89,7 @@ while [[ "$1" == -* ]]; do
         --force) 
             opt_force=1 
             
-            if [[ "$cmd" != "install" ]]; then
+            if [[ "$cmd" != "install" && "$cmd" != "remove" ]]; then
                 echo "Invalid option $1 for $cmd" >&2; exit 1 
             fi
         ;;
@@ -180,7 +180,20 @@ case "$pkg" in
             ;;
             
             remove)
-                apt-get purge "${argv[@]}"
+                apt-get purge "${argv[@]}"; ret=$?
+            
+                if [[ $ret -eq 100 && $opt_force -eq 1 ]]; then
+                    pkgs=()
+                    
+                    for pkg in "${argv[@]}"; do
+                        mapfile -t found < <(dpkg-query -W -f='${Package} ${Status}\n' "$pkg" 2>/dev/null | awk '$4 == "installed" {print $1}')
+                        pkgs+=("${found[@]}")
+                    done
+                    
+                    if [[ -n "${pkgs[*]}" ]]; then
+                        dpkg --purge --force-remove-essential,remove-protected "${pkgs[@]}"
+                    fi
+                fi
             ;;
             
             install)
@@ -319,7 +332,12 @@ case "$pkg" in
             ;;
             
             remove)
-                pacman -Rcns "${argv[@]}"
+                if [[ $opt_force -eq 1 ]]; then
+                    pacman -Rcnsdd "${argv[@]}"
+                
+                else
+                    pacman -Rcns "${argv[@]}"
+                fi
             ;;
             
             clean)
