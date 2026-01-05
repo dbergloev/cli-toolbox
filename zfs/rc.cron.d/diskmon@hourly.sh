@@ -16,7 +16,7 @@ timer="$1"
 ###
 #
 #
-case $timer in
+case "$timer" in
     startup|shutdown) exit 0 ;; # Unused
 esac
 
@@ -62,22 +62,30 @@ for pool in $(zpool list -H -o name); do
         done
     fi
     
-    if [ $state -eq 0 ]; then
+    if [[ $state -eq 0 ]]; then
         /usr/bin/alert --id zfs_health_$pool --timeout reset
     fi
     
-    avail=$(zfs get -Hp avail $pool | awk '{print $3}')
-    used=$(zfs get -Hp used $pool | awk '{print $3}')
-    perc=$(bc -l <<< "$used / ($avail + $used) * 100" | awk -F. '{print $1}')
-    
     echo "Checking disk usage"
+    read CAP FRAG <<< $(zpool list -H -o cap,frag $pool | tr -d '%')
+
+    if (( CAP >= 94 )); then
+      level="critical"
+    elif (( CAP >= 85 && FRAG >= 35 )); then
+      level="high"
+    elif (( CAP >= 70 && FRAG >= 45 )); then
+      level="medium"
+    elif (( CAP < 70 && FRAG >= 55 )); then
+      # Strange behaviour, give notice!
+      level="low"
+    else
+      level=""
+    fi
     
-    if [ $perc -gt 95 ]; then
-        echo "Warning : The zpool '$pool' exceeds 95% usage"
-        /usr/bin/alert --priority "medium" --title "ZFS Health Check" --id zfs_usage_$pool "The zpool '$pool' exceeds 95% usage"
+    if [[ -n "$level" ]]; then
+        /usr/bin/alert --priority $level --title "ZFS Health Check" --id zfs_usage_$pool --timeout 86400 "The zpool '$pool' exceeds ${CAP}% usage with ${FRAG}% fragmentation"
         
     else
         /usr/bin/alert --id zfs_usage_$pool --timeout reset
     fi
 done
-
