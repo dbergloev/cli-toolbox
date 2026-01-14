@@ -46,8 +46,8 @@ for pool in $(zpool list -H -o name); do
                 echo "    Realpath: $device"
             
                 if [[ ! " ${devices[*]} " =~ " $(basename $device) " ]]; then
-                    if /usr/sbin/smartctl -i $device >/dev/null 2>&1; then
-                        health="$(smartctl -H $device | tail -n 2)"
+                    if smartctl-overlay -i $device >/dev/null 2>&1; then
+                        health="$(smartctl-overlay -H $device | tail -n 2)"
                     
                         if grep -q ' result:' <<< "$health" && ! grep -q 'PASSED' <<< "$health"; then
                             devices+=( $(basename $device) )

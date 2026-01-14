@@ -25,11 +25,11 @@ for pool in $(zpool list -H -o name); do
         
         if [[ -n "$device" && -b $device ]]; then
             if [[ ! " ${devices[*]} " =~ " $(basename $device) " ]]; then
-                if /usr/sbin/smartctl -i $device >/dev/null 2>&1; then
+                if smartctl-overlay -i $device >/dev/null 2>&1; then
                     echo "Starting SmartCRL scan on device '$device'"
                     devices+=( $(basename $device) )
                     
-                    smartctl -t long $device
+                    smartctl-overlay -t long $device
                 
                 else
                     echo "The device '$device' is not compatible with SmartCTL."

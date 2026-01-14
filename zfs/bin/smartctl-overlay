@@ -1,0 +1,44 @@
+#!/bin/bash
+set -euo pipefail
+
+REAL_SMARTCTL="/usr/sbin/smartctl"
+CONF="/etc/smartctl-override.conf"
+
+# 1. If -d already present → passthrough
+for arg in "$@"; do
+    [[ "$arg" == "-d" || "$arg" == -d* ]] && exec "$REAL_SMARTCTL" "$@"
+done
+
+# 2. Assume last argument is the device
+device="${@: -1}"
+
+# Must exist and be a block device
+if [[ ! -b "$device" ]]; then
+    exec "$REAL_SMARTCTL" "$@"
+fi
+
+# 3. Read model (trim trailing spaces)
+sysdev="/sys/block/$(basename "$device")/device/model"
+[[ ! -r "$sysdev" ]] && exec "$REAL_SMARTCTL" "$@"
+
+model="$(sed 's/[[:space:]]*$//' "$sysdev")"
+
+# 4. Lookup driver
+driver="$(
+    awk -F= -v m="$model" '
+        /^[[:space:]]*#/ { next }
+        {
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", $1)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2)
+            if ($1 == m) { print $2; exit }
+        }
+    ' "$CONF" 2>/dev/null
+)"
+
+# 5. Inject -d only if found
+if [[ -n "$driver" ]]; then
+    exec "$REAL_SMARTCTL" -d "$driver" "$@"
+else
+    exec "$REAL_SMARTCTL" "$@"
+fi
+
