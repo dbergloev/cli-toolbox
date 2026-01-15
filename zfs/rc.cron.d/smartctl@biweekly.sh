@@ -29,7 +29,14 @@ for pool in $(zpool list -H -o name); do
                     echo "Starting SmartCRL scan on device '$device'"
                     devices+=( $(basename $device) )
                     
-                    smartctl-overlay -t long $device
+                    if smartctl-overlay -l selftest $device >/dev/null 2>&1; then
+                        if ! smartctl-overlay -t long $device; then
+                            echo "    Failed to initiate self test"
+                        fi
+                        
+                    else
+                        echo "    The device does not support self test"
+                    fi
                 
                 else
                     echo "The device '$device' is not SMART enabled."
