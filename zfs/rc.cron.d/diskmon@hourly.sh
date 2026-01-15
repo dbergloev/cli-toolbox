@@ -47,6 +47,38 @@ for pool in $(zpool list -H -o name); do
             
                 if [[ ! " ${devices[*]} " =~ " $(basename $device) " ]]; then
                     if smartctl-overlay -i $device 2>/dev/null | grep -Eq 'SMART support is:[[:space:]]*Enabled'; then
+                        read -r dev_type dev_temp <<< "$(
+                          smartctl-overlay -A "$device" 2>/dev/null | awk '
+                            # ATA / SATA / USB
+                            $1 == 194 { print "ATA", $10; exit }
+                            $1 == 190 { print "ATA", $10; exit }
+
+                            # NVMe
+                            /^Temperature:[[:space:]]*[0-9]+/ {
+                                print "NVMe", $2
+                                exit
+                            }
+
+                            # SAS
+                            /Current Drive Temperature:/ {
+                                print "SAS", $4
+                                exit
+                            }
+                          '
+                        )"
+                        
+                        if { [[ "$dev_type" == "SAS"  ]] && (( dev_temp >= 55 )); } ||
+                           { [[ "$dev_type" == "ATA"  ]] && (( dev_temp >= 50 )); } ||
+                           { [[ "$dev_type" == "NVMe" ]] && (( dev_temp >= 70 )); }
+                        then
+                            echo "The $dev_type device $device is above threshold at $dev_temp°C"
+                            /usr/bin/alert --priority "critical" --title "SmartCTL Health Check" --id zfs_health_$(basename $device) --timeout 86400 "The $dev_type device $device is above temperature threshold at $dev_temp°C"
+                    
+                        else
+                            echo "The $dev_type device $device is below temperature threshold at $dev_temp°C"
+                            /usr/bin/alert --priority "low" --title "SmartCTL Health Check" --id zfs_health_$(basename $device) --timeout reset "The $dev_type device $device is below temperature threshold at $dev_temp°C"
+                        fi
+                        
                         health="$(smartctl-overlay -H $device | grep overall-health)"
                     
                         if grep -q ' result:' <<< "$health" && ! grep -q 'PASSED' <<< "$health"; then
