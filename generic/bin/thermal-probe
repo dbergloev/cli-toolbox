@@ -94,7 +94,7 @@ if ls /sys/class/thermal/thermal_zone*/temp >/dev/null 2>&1; then
             for zone in /sys/class/thermal/thermal_zone*; do
                 if [ -d $zone ]; then
                     STAT=0
-                    TEMP=$(( $TEMP + $(cat $zone/temp) ))
+                    TEMP=$(( $TEMP + $(cat $zone/temp 2>/dev/null) ))
                     ((MED++))
                 fi
             done
@@ -115,8 +115,8 @@ if ls /sys/class/thermal/thermal_zone*/temp >/dev/null 2>&1; then
                 if [ -d $zone ]; then
                     STAT=0
                     
-                    type="$(cat $zone/type)"
-                    temp="$(cat $zone/temp)"
+                    type="$(cat $zone/type 2>/dev/null)"
+                    temp="$(cat $zone/temp 2>/dev/null)"
                     
                     if [[ $OPT_HUMAN -eq 1 ]]; then
                         temp="$(scale_unit $temp)"
