@@ -1,214 +1,26 @@
 # Make docker print 'ps' better
 function docker() {
-    if [[ "$1" == "netshoot" ]]; then
-        local container=${2:-unknown}
-        
-        if [ "$(docker inspect -f '{{.State.Running}}' $container 2>/dev/null)" != "true" ]; then
-            echo "The docker container $container is not running" >&2
-            
-        else
-            command docker run --rm --name netshoot --network container:$container -it nicolaka/netshoot /bin/bash
-        fi
+    if [[ "$1" == "compile" ]]; then
+        docker-compile "$2"
     
     elif [[ "$1" == "scan" ]]; then
-        # Run this in a non-interactive shell. This is better when background jobs are involved. 
-cat <<'EOF' | bash
-#!/bin/bash
-            
-            declare -i SPINNER_PID
-
-            spinner() {
-                local chars='|/-\\'
-                local image="$1"
-                
-                while :; do
-                    for ((i = 0; i < ${#chars}; i++)); do
-                        printf "\r[%c] Checking %s..." "${chars:$i:1}" $image
-                        sleep 0.1
-                    done
-                done
-            }
-            
-            for container_id in $(command docker ps -q); do
-                NAME=$(command docker inspect --format '{{.Name}}' "$container_id" | sed 's|^/||')
-                IMAGE=$(command docker inspect --format '{{.Config.Image}}' "$container_id")
-                IMAGE_ID=$(command docker inspect --format '{{.Image}}' "$container_id")
-                IMAGE_TAG=$(docker inspect --format '{{ or (index .Config.Labels "update.tag") "latest" }}' $NAME)
-                VALID=1
-                
-                if [[ "$IMAGE" == *:* ]]; then
-                    REPO="${IMAGE%%:*}"
-                else
-                    REPO="$IMAGE"
-                fi
-                
-                spinner $NAME &
-                SPINNER_PID=$!
-                
-                if ! command docker pull $REPO:$IMAGE_TAG >/dev/null 2>&1; then
-                    VALID=0
-                fi
-                
-                { # Wrap this to avoid killing the entire script, depending on things like set -e
-                  kill "$SPINNER_PID" 2>/dev/null
-                  wait "$SPINNER_PID" 2>/dev/null
-                } || true
-                
-                if [ $VALID -eq 1 ]; then
-                    if [[ "$(command docker inspect --format='{{.Id}}' $REPO:$IMAGE_TAG)" != "$IMAGE_ID" ]]; then
-                        printf "\r\033[K[\033[0;31m!\033[0m] %s: \033[0;31mUpdate available\033[0m\n" "$NAME"
-                    
-                    else
-                        printf "\r\033[K[\033[0;32m✓\033[0m] %s: \033[0;32mUp to date\033[0m\n" "$NAME"
-                    fi
-                
-                else
-                    printf "\r\033[K[-] %s: Not checking\n" "$NAME"
-                fi
-            done
-EOF
+        docker-scan
     
     elif [[ "$1" == "ls" ]]; then
-        echo "+"
-        printf "| %-16s | %-22s | %-11s | %-11s | %-14s\n" "CONTAINER ID" "NAME " "STATE " "STATUS " "IP ADDRESS" 
-        echo "+------------------+------------------------+-------------+-------------+----------------"
-
-        local z=0 y=0
-
-        while IFS= read -r line; do
-            local id=$(echo "$line" | awk '{print $1}')
-            local name=$(echo "$line" | awk '{print $2}')
-            local state=$(echo "$line" | awk '{print $3}')
-            local status=$(echo "$line" | grep -oE '\(([a-z]+)\)$' | grep -oE '[a-z]+')
-            local ips=$(command docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' $id)
-            
-            printf "| %-16s | %-22s | %-11s | %-11s | %-14s\n" "$id" "$name " "$state " "$status " "$ips"
-            
-            if [[ "$state" == "running" ]]; then
-                y=$(($y + 1))
-            else
-                z=$(($z + 1))
-            fi
-
-        done < <(command docker ps -a --format "table {{.ID}}\t{{.Names}}\t{{.State}}\t{{.Status}}" | tail -n +2)
-
-        printf "\n %i running, %i stopped\n" $y $z
+        docker-ls
         
     elif [[ "$1" == "info" && -n "$2" && "${2:0:1}" != "-" ]]; then
-        local line key value i
-
-        ##
-        # Print general information
-        #
-        local -A general=(
-            ["ID:"]="$(command docker inspect -f '{{.ID}}' $2 2>/dev/null | awk '{print substr($0, 1, 12)}')"
-            ["Image:"]="$(command docker inspect -f '{{.Config.Image}}' $2 2>/dev/null)"
-            ["Name:"]="$(command docker inspect -f '{{.Name}}' $2 2>/dev/null | sed 's/^\///')"
-            ["State:"]="$(command docker inspect -f '{{.State.Status}}' $2 2>/dev/null)"
-            ["Health:"]="$(command docker inspect -f '{{.State.Health.Status}}' $2 2>/dev/null)"
-            ["NetworkMode:"]="$(command docker inspect -f '{{.HostConfig.NetworkMode}}' $2 2>/dev/null)"
-            ["Restart:"]="$(command docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' $2 2>/dev/null)"
-        )
-
-        for key in "${!general[@]}"; do
-            if [ -n "${general[$key]}" ]; then
-                if [[ "$key" == "NetworkMode:" ]] && grep -qe '^container:' <<< "${general[$key]}"; then
-                    value="$(command docker inspect -f '{{.Name}}' $(awk -F: '{print $2}' <<< "${general[$key]}") 2>/dev/null | sed 's/^\///')"
-                    
-                    if [ -n "$value" ]; then
-                        general[$key]="container:$value"
-                    fi
-                fi
-            
-                printf "%-16s %s\n" "$key" "${general[$key]}"
-            fi
-        done
-
-        ##
-        # Print Networks
-        #
-        i=0
-        while read line; do
-            key="$(awk -F ':' '{print $1}' <<< "$line")"
-            value="$(awk -F ':' '{print substr($0, index($0, ":") + 1)}' <<< "$line")"
-            
-            if [ -n "$value" ]; then
-                if [ $i -eq 0 ]; then
-                    echo "Networks:"
-                fi
-            
-                i=$(($i + 1))
-                printf "    %-12s %s\n" "${key}:" "$value"
-            fi
-
-        done < <(command docker inspect -f '{{range $net, $conf := .NetworkSettings.Networks}}{{printf "%s:%s\n" $net $conf.IPAddress}}{{end}}' $2 2>/dev/null)
-
-        ##
-        # Print Network Ports
-        #
-        i=0
-        while read line; do
-            key="$(awk -F ':' '{print $1}' <<< "$line")"
-            value="$(awk -F ':' '{print substr($0, index($0, ":") + 1)}' <<< "$line")"
-            
-            if [[ -n "$value" && "$value" != "[]" ]]; then
-                if [ $i -eq 0 ]; then
-                    echo "Exposed Ports:"
-                fi
-            
-                i=$(($i + 1))
-                printf "    %-12s %-12s %s\n" "-" "${key}" "$value"
-            fi
-
-        done < <(command docker inspect -f '{{range $port, $conf := .NetworkSettings.Ports}}{{printf "%s:%s\n" $port $conf}}{{end}}' $2 2>/dev/null)
-
-        ##
-        # Print Volumes
-        #
-        i=0
-        while read line; do
-            if [[ -n "$line" ]]; then
-                if [ $i -eq 0 ]; then
-                    echo "Volumes:"
-                fi
-            
-                i=$(($i + 1))
-                printf "    %-12s %s\n" "-" "$line"
-            fi
-
-        done < <(command docker inspect -f '{{range $conf := .Mounts}}{{printf "%s\n" $conf.Destination}}{{end}}' $2 2>/dev/null)
+        docker-info "$2"
         
-        ##
-        # Print Devices
-        #
-        i=0
-        while read line; do
-            if [[ -n "$line" ]]; then
-                if [ $i -eq 0 ]; then
-                    echo "Devices:"
-                fi
-            
-                i=$(($i + 1))
-                printf "    %-12s %s\n" "-" "$line"
-            fi
-
-        done < <(command docker inspect -f '{{range $conf := .HostConfig.Devices}}{{printf "%s\n" $conf.PathInContainer}}{{end}}' $2 2>/dev/null)
+    elif [[ "$1" == "start" ]]; then
+        docker-start "$2"
         
-        ##
-        # Print CapAdd
-        #
-        i=0
-        while read line; do
-            if [[ -n "$line" ]]; then
-                if [ $i -eq 0 ]; then
-                    echo "Capabilities:"
-                fi
-            
-                i=$(($i + 1))
-                printf "    %-12s %s\n" "-" "$line"
-            fi
-
-        done < <(command docker inspect -f '{{range $conf := .HostConfig.CapAdd}}{{printf "%s\n" $conf}}{{end}}' $2 2>/dev/null)
+    elif [[ "$1" == "stop" ]]; then
+        docker-stop "$2"
+        
+    elif [[ "$1" == "restart" ]]; then
+        docker-stop "$2"
+        docker-start "$2"
 
     else
         command docker "$@"

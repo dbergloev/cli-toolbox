@@ -8,11 +8,6 @@ if ! declare -f __start_docker_original >/dev/null; then
     eval "$(declare -f __start_docker | sed 's/__start_docker/__start_docker_original/')"
 fi
 
-# Function to list running container names
-__docker_list_running_containers() {
-  command docker ps --format '{{.Names}}'
-}
-
 # Extend Docker's completion dispatcher
 __start_docker() {
   local cur prev words cword
@@ -20,24 +15,34 @@ __start_docker() {
 
   # Add custom subcommands to top-level
   if [[ $cword -eq 1 ]]; then
-    local custom_cmds="scan ls netshoot info make"
+    local custom_cmds="scan ls compile"
     local default_cmds="$(__docker_list_commands)"
     COMPREPLY=( $(compgen -W "$default_cmds $custom_cmds" -- "$cur") )
     return
   fi
 
   case "${words[1]}" in
-    netshoot)
-      # Suggest running container names
+    info|start|stop|restart)
+      # Suggest running container names if argument expected
       if [[ $cword -eq 2 ]]; then
         COMPREPLY=( $(compgen -W "$(__docker_list_running_containers)" -- "$cur") )
       fi
       return
       ;;
-    info)
-      # Suggest running container names if argument expected
+    compile)
       if [[ $cword -eq 2 ]]; then
-        COMPREPLY=( $(compgen -W "$(__docker_list_running_containers)" -- "$cur") )
+        local completions
+        mapfile -t completions < <(__docker_list_container_defs)
+
+        COMPREPLY=( $(compgen -W "${completions[*]}" -- "$cur") )
+
+        # If any match ends with '@', disable trailing space
+        for c in "${COMPREPLY[@]}"; do
+          if [[ "$c" == *@ ]]; then
+            compopt -o nospace
+            break
+          fi
+        done
       fi
       return
       ;;
@@ -51,7 +56,24 @@ __start_docker() {
   __start_docker_original "$@"
 }
 
-# Helper: get original docker commands (improves Tab UI)
+# Helper: to list running container names
+__docker_list_running_containers() {
+  command docker ps --format '{{.Names}}'
+}
+
+# Helper: get original docker commands (optional, improves Tab UI)
 __docker_list_commands() {
   command docker --help | awk '/Commands:/,/^$/ { if ($1 != "Commands:" && $1 != "") print $1 }'
 }
+
+# Helper: get all available container build names
+__docker_list_container_defs() {
+  local dir="/etc/docker/containers"
+  [[ -d "$dir" ]] || return
+
+  for f in "$dir"/*.container; do
+    [[ -e "$f" ]] || continue
+    basename "$f" .container
+  done
+}
+

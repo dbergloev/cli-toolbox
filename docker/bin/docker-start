@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+#
+# Alternative to "docker start" which provides pod like feature
+# that will auto start any depended parent namespaced container. 
+#
+
+set -e
+
+id="$1"
+
+if [ -z "$id" ]; then
+    echo "Usage: docker-start <container>"
+    exit 1
+fi
+
+# Get network mode
+netmode=$(command docker inspect -f '{{.HostConfig.NetworkMode}}' "$id")
+id="$(command docker inspect -f '{{.Id}}' "$id")"
+
+if [[ "$netmode" == container:* ]]; then
+    ref="${netmode#container:}"
+    state=$(command docker inspect -f '{{.State.Status}}' "$ref")
+    
+    if [[ "$state" != "running" ]]; then
+        "$0" "$ref"
+    fi
+fi
+
+state=$(command docker inspect -f '{{.State.Status}}' "$id")
+name=$(command docker inspect -f '{{.Name}}' "$id" | sed 's:^/::')
+
+if [[ "$state" == "running" ]]; then
+    echo "$name is already running"
+    exit 0
+fi
+
+echo "Starting $name"
+command docker start "$id"
+

@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+
+id="$1"
+
+##
+# Print general information
+#
+declare -A general=(
+    ["ID:"]="$(command docker inspect -f '{{.ID}}' $id 2>/dev/null | awk '{print substr($0, 1, 12)}')"
+    ["Image:"]="$(command docker inspect -f '{{.Config.Image}}' $id 2>/dev/null)"
+    ["Name:"]="$(command docker inspect -f '{{.Name}}' $id 2>/dev/null | sed 's/^\///')"
+    ["State:"]="$(command docker inspect -f '{{.State.Status}}' $id 2>/dev/null)"
+    ["Health:"]="$(command docker inspect -f '{{.State.Health.Status}}' $id 2>/dev/null)"
+    ["NetworkMode:"]="$(command docker inspect -f '{{.HostConfig.NetworkMode}}' $id 2>/dev/null)"
+    ["Restart:"]="$(command docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' $id 2>/dev/null)"
+)
+
+for key in "${!general[@]}"; do
+    if [ -n "${general[$key]}" ]; then
+        if [[ "$key" == "NetworkMode:" ]] && grep -qe '^container:' <<< "${general[$key]}"; then
+            value="$(command docker inspect -f '{{.Name}}' $(awk -F: '{print $2}' <<< "${general[$key]}") 2>/dev/null | sed 's/^\///')"
+            
+            if [ -n "$value" ]; then
+                general[$key]="container:$value"
+            fi
+        fi
+    
+        printf "%-18s %s\n" "$key" "${general[$key]}"
+    fi
+done
+
+##
+# Print Networks
+#
+i=0
+
+while IFS='|' read -r net ips; do
+    # trim
+    ips="${ips#"${ips%%[![:space:]]*}"}"
+
+    # skip empty
+    [[ -z "$ips" ]] && continue
+
+    # split into array
+    read -r -a addr <<< "$ips"
+
+    # filter empty values
+    filtered=()
+    for a in "${addr[@]}"; do
+        [[ -n "$a" ]] && filtered+=("$a")
+    done
+
+    ((${#filtered[@]})) || continue
+
+    if ((i == 0)); then
+        echo "Networks:"
+    fi
+
+    i=$((i + 1))
+
+    # first line
+    printf "    %-14s %s\n" "${net}:" "${filtered[0]}"
+
+    # remaining IPs (aligned)
+    for ((j=1; j<${#filtered[@]}; j++)); do
+        printf "    %-14s %s\n" "" "${filtered[j]}"
+    done
+
+done < <(
+    command docker inspect -f '{{range $name, $conf := .NetworkSettings.Networks}}{{printf "%s|" $name}}{{printf "%s %s\n" $conf.IPAddress $conf.GlobalIPv6Address}}{{end}}' "$id" 2>/dev/null
+)
+
+##
+# Print Network Ports
+#
+i=0
+while read -r line; do
+    [[ -z "$line" ]] && continue
+
+    if ((i == 0)); then
+        echo "Ports:"
+    fi
+
+    i=$((i + 1))
+    printf "    %-14s %s\n" "-" "${line//->/ -> }"
+
+done < <(
+    command docker inspect -f '
+{{range $port, $conf := .NetworkSettings.Ports}}
+{{- if $conf}}
+    {{- range $conf}}
+{{printf "%s:%s->%s\n" .HostIp .HostPort $port}}
+    {{- end}}
+{{- else}}
+{{printf "%s\n" $port}}
+{{- end}}
+{{end}}' "$id" 2>/dev/null
+)
+
+##
+# Print Volumes
+#
+i=0
+while read -r line; do
+    [[ -z "$line" ]] && continue
+
+    if ((i == 0)); then
+        echo "Volumes:"
+    fi
+
+    ((i++))
+    printf "    %-14s %s\n" "-" "$line"
+
+done < <(
+    command docker inspect -f '
+{{range $conf := .Mounts}}
+{{if $conf.RW}}
+{{printf "%s -> %s (%s,rw)\n" $conf.Source $conf.Destination $conf.Type}}
+{{else}}
+{{printf "%s -> %s (%s,ro)\n" $conf.Source $conf.Destination $conf.Type}}
+{{end}}
+{{end}}' "$id" 2>/dev/null
+)
+
+##
+# Print Devices
+#
+i=0
+while read -r line; do
+    [[ -z "$line" ]] && continue
+
+    if ((i == 0)); then
+        echo "Devices:"
+    fi
+
+    i=$((i + 1))
+    printf "    %-14s %s\n" "-" "$line"
+
+done < <(
+    command docker inspect -f '
+{{range $conf := .HostConfig.Devices}}
+{{printf "%s -> %s (%s)\n" $conf.PathOnHost $conf.PathInContainer $conf.CgroupPermissions}}
+{{end}}' "$id" 2>/dev/null
+)
+
+##
+# Print CapAdd
+#
+i=0
+while read -r line; do
+    if [[ -n "$line" ]]; then
+        if [ $i -eq 0 ]; then
+            echo "Capabilities:"
+        fi
+    
+        ((i++))
+        printf "    %-14s %s\n" "-" "$line"
+    fi
+
+done < <(command docker inspect -f '{{range $conf := .HostConfig.CapAdd}}{{printf "%s\n" $conf}}{{end}}' $id 2>/dev/null)
+

@@ -1,0 +1,260 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+###
+# Collect valid docker create flags
+#
+mapfile -t DOCKER_FLAGS < <(
+    command docker create --help \
+    | grep -oE -- '--[a-zA-Z0-9][a-zA-Z0-9-]*' \
+    | sort -u
+)
+
+###
+# Check if flag exists
+#
+flag_exists() {
+    local flag="$1"
+
+    for f in "${DOCKER_FLAGS[@]}"; do
+        [[ "$f" == "$flag" ]] && return 0
+    done
+
+    return 1
+}
+
+###
+#
+#
+extract_profiles() {
+    local file="$1"
+    local line key val section=""
+
+    while IFS= read -r line; do
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+
+        [[ -z "$line" || "$line" == \#* ]] && continue
+
+        if [[ "$line" =~ ^\[.*\]$ ]]; then
+            section="${line:1:-1}"
+            continue
+        fi
+
+        [[ "$section" != "config" ]] && continue
+
+        key="${line%%=*}"
+        val="${line#*=}"
+
+        key="${key// /}"
+        val="${val#"${val%%[![:space:]]*}"}"
+
+        if [[ "$key" == "profile" ]]; then
+            IFS=',' read -r -a found <<< "$val"
+
+            for p in "${found[@]}"; do
+                p="${p#"${p%%[![:space:]]*}"}"
+                p="${p%"${p##*[![:space:]]}"}"
+                [[ -n "$p" ]] && echo "$p"
+            done
+        fi
+    done < "$file"
+}
+
+###
+#
+#
+parse_profile() {
+    local file="$1"
+    local base_dir="$2"
+    local p
+
+    # First: resolve dependencies
+    while IFS= read -r p; do
+        local profile_file="$base_dir/$p.profile"
+
+        if [[ ! -f "$profile_file" ]]; then
+            echo "Profile '$p' not found ($profile_file)" >&2
+            exit 1
+        fi
+
+        parse_profile "$profile_file" "$base_dir"
+    done < <(extract_profiles "$file")
+
+    # Then: apply this file
+    parse_config "$file"
+}
+
+###
+#
+#
+parse_config() {
+    local file="$1"
+    local section=""
+
+    while IFS= read -r line; do
+        # trim
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+
+        [[ -z "$line" || "$line" == \#* ]] && continue
+
+        if [[ "$line" =~ ^\[.*\]$ ]]; then
+            section="${line:1:-1}"
+            continue
+        fi
+
+        key="${line%%=*}"
+        val="${line#*=}"
+
+        key="${key// /}"
+        val="${val#"${val%%[![:space:]]*}"}"
+
+        case "$section" in
+            config)
+                case "$key" in
+                    repo)
+                        repo="$val"
+                    ;;
+                    
+                    profile) ;;
+                    
+                    cmd|command)
+                        read -r -a cmd <<< "$val"
+                    ;;
+                    
+                    mode)
+                        case "$val" in
+                            run|create|start)
+                                mode="$val"
+                            ;;
+                            *)
+                                echo "Invalid mode '$val'" >&2
+                                exit 1
+                            ;;
+                        esac
+                    ;;
+                    
+                    *)
+                        echo "Invalid configuration option '$key'" >&2
+                        exit 1
+                    ;;
+                esac
+            ;;
+            
+            container)
+                flag="--$key"
+                val="${val//%i/$instance}"
+
+                if ! flag_exists "$flag"; then
+                    echo "Invalid container option '$key'" >&2
+                    exit 1
+                fi
+
+                case "$val" in
+                    false) ;;
+                    true)  args+=("$flag") ;;
+                    *)     args+=("$flag" "$val") ;;
+                esac
+
+                case "$key" in
+                    name)
+                        has_name=true
+                        name="$val"
+                    ;;
+                    hostname)
+                        has_hostname=true
+                    ;;
+                    network)
+                        network_mode="$val"
+                    ;;
+                esac
+            ;;
+            
+            *)
+                echo "Invalid section '$section'" >&2
+                exit 1
+            ;;
+        esac
+
+    done < "$file"
+}
+
+###
+# Main
+#
+
+declare name="$1"
+declare instance=""
+
+if [[ "$name" == *"@"* ]]; then
+    instance="${name#*@}"
+    name="${name%@*}@"
+fi
+
+declare base_dir="/etc/docker/containers"
+declare file="$base_dir/$name.container"
+
+if [[ ! -f "$file" ]]; then
+    echo "No build file for the container '$name'" >&2
+    exit 1
+fi
+
+declare repo=""
+declare mode="start"
+declare -a args=()
+declare -a cmd=()
+declare -a profiles=()
+
+declare has_name=false
+declare has_hostname=false
+declare network_mode=""
+
+###
+# Load configuration
+#
+
+# default first (acts like base profile)
+if [[ -f "$base_dir/default.profile" ]]; then
+    parse_profile "$base_dir/default.profile" "$base_dir"
+fi
+
+# then container
+parse_profile "$file" "$base_dir"
+
+###
+# Final argument adjustments
+#
+
+if ! $has_name; then
+    args+=("--name" "$name")
+fi
+
+if ! $has_hostname && [[ "$network_mode" != container:* ]]; then
+    args+=("--hostname" "$name")
+fi
+
+###
+# Recreate container if exists
+#
+
+if docker container inspect "$name" >/dev/null 2>&1; then
+    docker-stop "$name"
+    command docker rm "$name"
+fi
+
+###
+# Create + start
+#
+
+if [[ "$mode" == "run" ]]; then
+    command docker run "${args[@]}" "$repo" "${cmd[@]}"
+
+else
+    command docker create "${args[@]}" "$repo" "${cmd[@]}"
+    
+    if [[ "$mode" == "start" ]]; then
+        docker-start "$name"
+    fi
+fi
+

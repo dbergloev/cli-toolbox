@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+#
+# Alternative to 'docker ps' with proper layout and pod like display of containers.
+# 
+# This is a graph rather than a clean tree. 
+# The list will group linked containers below the ones they link to which means that
+# a container with several links can be displayed multiple times. This is a relationship graph
+# and not just a plain list.
+#
+ 
+declare running=0
+declare stopped=0
+
+###
+# Split IPv4 and IPv6 addresses and 
+# append them underneath one another rather than side by side. 
+#
+# Example:
+#      1.1.1.1 2.2.2.2 fd16:b2c3:d4e5:1::5
+#
+#      Output -> 1.1.1.1 fd16:b2c3:d4e5:1::5
+#                2.2.2.2
+#
+add_row() {
+    local id="$1"
+    local name="$2"
+    local state="$3"
+    local ipv4="$4"
+    local ipv6="$5"
+
+    readarray -t v4s <<< "$(tr ' ' '\n' <<< "$ipv4")"
+    readarray -t v6s <<< "$(tr ' ' '\n' <<< "$ipv6")"
+
+    local max=${#v4s[@]}
+    [[ ${#v6s[@]} -gt $max ]] && max=${#v6s[@]}
+
+    for ((i=0;i<max;i++)); do
+              # NAME | ID | STATE | IPv4 | IPv6
+        printf " %-20s %-14.12s %-11s %-14s %-20s\n" \
+            "${name:-}" \
+            "${id:-}" \
+            "${state:-}" \
+            "${v4s[i]:-}" \
+            "${v6s[i]:-}"
+
+        id=""
+        name=""
+        state=""
+    done
+}
+
+###
+#
+#
+build_row() {
+    local id="$1"
+    local prefix="$2"
+    
+    local name=$(command docker inspect -f '{{.Name}}' "$id" | sed 's:^/::')
+    local state=$(command docker inspect -f '{{.State.Status}}' "$id")
+    
+    local ipv4 ipv6
+    
+    # Count states
+    if [[ "$state" == "running" ]]; then
+        ((running++))
+    else
+        ((stopped++))
+    fi
+
+    readarray -t ips < <(
+        command docker inspect "$id" \
+        --format '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{.GlobalIPv6Address}}{{"\n"}}{{end}}'
+    )
+
+    for line in "${ips[@]}"; do
+        v4=$(awk "{print \$1}" <<< "$line")
+        v6=$(awk "{print \$2}" <<< "$line")
+
+        [[ -n "$v4" ]] && ipv4+="$v4 "
+        [[ -n "$v6" ]] && ipv6+="$v6 "
+    done
+
+    ipv4="${ipv4%% }"
+    ipv6="${ipv6%% }"
+    
+    add_row "$id" "${prefix}${name}" "$state" "$ipv4" "$ipv6"
+}
+
+###
+#
+#
+declare -A ID_CHILDREN
+declare -A ID_GROUPS
+declare ID_ORPHANS
+declare ID_PARENTS
+
+mapfile -t IDS < <(command docker ps -a --no-trunc -q)
+
+# Build relationships
+for id in "${IDS[@]}"; do
+    netmode="$(command docker inspect -f '{{.HostConfig.NetworkMode}}' "$id")"
+    
+    case "$netmode" in
+        container:*)
+            ref="${netmode#container:}"
+            
+            if docker container inspect "$ref" >/dev/null 2>&1; then
+                ID_CHILDREN["$ref"]+="$id "
+            
+            else
+                ID_ORPHANS+="$id "
+            fi
+        ;;
+        
+        *)
+            links=$(command docker inspect -f '{{range .NetworkSettings.Networks}}{{range .Links}}{{.}} {{end}}{{end}}' "$id")
+            
+            for link in $links; do
+                # Format: mariadb:db
+                pname="${link%%:*}"
+
+                # Resolve to full ID
+                pid=$(command docker inspect -f '{{.Id}}' "$pname" 2>/dev/null || true)
+
+                if [[ -n "$pid" ]]; then
+                    ID_GROUPS["$pid"]+="$id "
+                    
+                else
+                    ID_ORPHANS+="$id "
+                fi
+            done
+            
+            ID_PARENTS+="$id "
+        ;;
+    esac
+done
+
+# Build table
+echo ""
+printf " %-20s %-14.12s %-11s %-14s %-20s\n" "NAME" "ID" "STATE" "IPv4" "IPv6"
+echo ""
+
+for id in $ID_PARENTS; do
+    build_row "$id"
+    
+    if [[ -n "${ID_CHILDREN[$id]:-}" ]]; then
+        for cid in ${ID_CHILDREN[$id]}; do
+            build_row "$cid" " + "
+        done
+    fi
+    
+    if [[ -n "${ID_GROUPS[$id]:-}" ]]; then
+        for cid in ${ID_GROUPS[$id]}; do
+            build_row "$cid" " - "
+        done
+    fi
+done
+
+echo ""
+
+for id in $ID_ORPHANS; do
+    build_row "$id" " ! "
+done
+
+# Summary
+echo ""
+echo " $running running, $stopped stopped"
+echo ""
+

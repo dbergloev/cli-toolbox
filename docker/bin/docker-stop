@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+#
+# Alternative to "docker stop" which provides pod like feature
+# that will auto stop any children depended on this namespace. 
+#
+
+set -e
+
+id="$1"
+
+if [ -z "$id" ]; then
+    echo "Usage: docker-stop <container>"
+    exit 1
+fi
+
+# Resolve container ID of target
+id="$(command docker inspect -f '{{.Id}}' "$id")"
+
+# Find dependent containers
+command docker ps -a -q | while read -r cid; do
+    # Get network mode
+    netmode=$(command docker inspect -f '{{.HostConfig.NetworkMode}}' "$cid")
+    
+    case "$netmode" in
+        container:*)
+            ref="${netmode#container:}"
+            
+            if [[ "$id" == "$ref" ]]; then
+                state=$(command docker inspect -f '{{.State.Status}}' "$cid")
+                
+                if [[ "$state" == "running" ]]; then
+                    "$0" "$cid"
+                fi
+            fi
+        ;;
+    esac
+done
+
+state=$(command docker inspect -f '{{.State.Status}}' "$id")
+name=$(command docker inspect -f '{{.Name}}' "$id" | sed 's:^/::')
+
+if [[ "$state" != "running" ]]; then
+    echo "$name is not running"
+    exit 0
+fi
+
+echo "Stopping $name"
+command docker stop "$id"
+

@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+
+declare -i SPINNER_PID
+
+spinner() {
+    local chars='|/-\\'
+    local image="$1"
+    
+    while :; do
+        for ((i = 0; i < ${#chars}; i++)); do
+            printf "\r\033[K[%c] Checking %s..." "${chars:$i:1}" "$image"
+            sleep 0.1
+        done
+    done
+}
+
+for container_id in $(command docker ps -q); do
+    read -r NAME IMAGE IMAGE_ID <<< "$(
+        command docker inspect --format '{{.Name}} {{.Config.Image}} {{.Image}}' "$container_id" \
+        | sed 's|^/||'
+    )"
+    IMAGE_TAG="$(command docker inspect --format '{{ or (index .Config.Labels "update.tag") "latest" }}' "$container_id")"
+    VALID=1
+    
+    REPO="${IMAGE%:*}"
+    [[ "$REPO" == "$IMAGE" ]] && REPO="$IMAGE"
+    
+    spinner "$NAME" &
+    SPINNER_PID=$!
+    
+    if ! command docker pull $REPO:$IMAGE_TAG >/dev/null 2>&1; then
+        VALID=0
+    fi
+    
+    { # Wrap this to avoid killing the entire script, depending on things like set -e
+      kill "$SPINNER_PID" 2>/dev/null
+      wait "$SPINNER_PID" 2>/dev/null
+    } || true
+    
+    if [ $VALID -eq 1 ]; then
+        if [[ "$(command docker inspect --format='{{.Id}}' $REPO:$IMAGE_TAG)" != "$IMAGE_ID" ]]; then
+            printf "\r\033[K[\033[0;31m!\033[0m] %s: \033[0;31mUpdate available\033[0m\n" "$NAME"
+        
+        else
+            printf "\r\033[K[\033[0;32m✓\033[0m] %s: \033[0;32mUp to date\033[0m\n" "$NAME"
+        fi
+    
+    else
+        printf "\r\033[K[-] %s: Not checking\n" "$NAME"
+    fi
+done
+

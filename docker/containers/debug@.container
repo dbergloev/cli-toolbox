@@ -1,0 +1,20 @@
+#
+# Debug container.
+# This can be launched using `docker compile debug@<container>` to 
+# attach it to the namespace of <container>. 
+#
+
+[config]
+
+    repo = nicolaka/netshoot:latest
+    command = /bin/bash
+    mode = run
+
+[container]
+
+    name = netshoot
+    network = container:%i
+    rm = true
+    tty = true
+    interactive = true
+    
