@@ -144,7 +144,7 @@ parse_config() {
             
             container)
                 flag="--$key"
-                val="${val//%i/$instance}"
+                val="$(expand_value "$val")"
 
                 if ! flag_exists "$flag"; then
                     echo "Invalid container option '$key'" >&2
@@ -178,6 +178,34 @@ parse_config() {
         esac
 
     done < "$file"
+}
+
+###
+#
+#
+expand_value() {
+    local v="$1"
+    local re='<file:([^>]+)>'
+
+    # replace %i
+    v="${v//%i/$instance}"
+
+    # replace all <file:...>
+    while [[ "$v" =~ $re ]]; do
+        local path="${BASH_REMATCH[1]}"
+        local content
+
+        if [[ ! -f "$path" ]]; then
+            echo "File not found: $path" >&2
+            exit 1
+        fi
+
+        content="$(<"$path")"
+
+        v="${v/<file:$path>/$content}"
+    done
+
+    printf "%s" "$v"
 }
 
 ###
