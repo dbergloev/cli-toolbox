@@ -1,0 +1,527 @@
+#!/usr/bin/env bash
+#
+# Front-end to Samba AD DC that combines various tools into a single, consistent interface for managing accounts, 
+# Kerberos principals (SPNs), and keytabs, while hiding Samba quirks and enabling fast, scriptable workflows.
+#
+
+set -euo pipefail
+
+cmd="${1:-}"
+arg="${2:-}"
+
+###
+#
+#
+require_cmd() {
+    local cmd="$1"
+    local pkg="$2"
+
+    command -v "$cmd" >/dev/null 2>&1 || {
+        echo "Error: missing '$cmd' (install package: $pkg)" >&2
+        exit 1
+    }
+}
+
+###
+#
+#
+get_samdb() {
+    local privdir
+
+    if privdir="$(testparm -s --parameter-name=private\ dir 2>/dev/null)"; then
+        echo "${privdir}/sam.ldb"
+        return
+    fi
+
+    # fallback (common default)
+    echo "/var/lib/samba/private/sam.ldb"
+}
+
+###
+#
+#
+print_usage() {
+    echo "Usage: $0 CMD ARG [...]"
+    echo ""
+    echo "  princ list"
+    echo "  princ add ACCOUNT PRINCIPAL"
+    echo "  princ del ACCOUNT PRINCIPAL"
+    echo "  princ export ACCOUNT KEYTAB"
+    echo ""
+    echo "  account list"
+    echo "  account add ACCOUNT [--nfs|--cifs]"
+    echo "  account del ACCOUNT"
+    echo "  account show ACCOUNT"
+    echo "  account passwd ACCOUNT"
+}
+
+###
+# samba-tool always prints to stderr, even on success. 
+# It's output is also inconsistent, for an example it will 
+# write something like "Export one principal" even though it exported multiple.
+#
+# We provide our own messages and are only interested in actual errors. 
+# This function will run a command, buffer the output and only print
+# if result code is grater than 0.
+#
+run_cmd() {
+    local output status
+
+    # capture BOTH stdout + stderr
+    output="$("$@" 2>&1)"
+    status=$?
+
+    if [[ $status -ne 0 ]]; then
+        printf '%s\n' "$output" >&2
+        return $status
+    fi
+
+    return 0
+}
+
+###
+#
+#
+account_exists() {
+    local acc="$1"
+
+    if [[ "$acc" == *"$" ]]; then
+        samba-tool computer show "$acc" &>/dev/null
+    else
+        samba-tool user show "$acc" &>/dev/null
+    fi
+}
+
+###
+#
+#
+princ_list() {
+    ldbsearch -H /var/lib/samba/private/sam.ldb \
+        "(servicePrincipalName=*)" \
+        sAMAccountName servicePrincipalName \
+    | awk '
+        /^sAMAccountName:/ {
+            account = $2
+            if (account != prev_account) {
+                if (NR > 1) print ""
+                print account
+                prev_account = account
+            }
+        }
+        /^servicePrincipalName:/ {
+            spn = $2
+            print "  " spn
+        }
+    '
+}
+
+###
+#
+#
+princ_add() {
+    local acc="${1:-}"
+    local spn="${2:-}"
+
+    if [[ -z "$acc" || -z "$spn" ]]; then
+        echo "Missing arguments" >&2
+        exit 1
+
+    elif ! account_exists "$acc"; then
+        echo "Account does not exist: $acc" >&2
+        exit 1
+    
+    elif samba-tool spn list "$acc" 2>/dev/null | grep -q -F "$spn"; then
+        echo "SPN already exists: $spn"
+        return
+    fi
+
+    echo "Adding $spn → $acc"
+    run_cmd samba-tool spn add "$spn" "$acc"
+}
+
+###
+#
+#
+princ_del() {
+    local acc="${1:-}"
+    local spn="${2:-}"
+
+    if [[ -z "$acc" || -z "$spn" ]]; then
+        echo "Missing arguments" >&2
+        exit 1
+
+    elif ! account_exists "$acc"; then
+        echo "Account does not exist: $acc" >&2
+        exit 1
+
+    elif ! samba-tool spn list "$acc" 2>/dev/null | grep -q -F "$spn"; then
+        echo "SPN not found on $acc: $spn"
+        return
+    fi
+
+    echo "Removing $spn from $acc"
+    run_cmd samba-tool spn delete "$spn" "$acc"
+}
+
+###
+#
+#
+princ_export() {
+    local acc="${1:-}"
+    local keytab="${2:-}"
+
+    if [[ -z "$acc" || -z "$keytab" ]]; then
+        echo "Missing arguments" >&2
+        exit 1
+
+    elif ! account_exists "$acc"; then
+        echo "Account does not exist: $acc" >&2
+        exit 1
+        
+    elif [[ -e "$keytab" ]]; then
+        read -rp "Overwrite $keytab? [y/N] " confirm
+        [[ "$confirm" == "y" || "$confirm" == "Y" ]] || exit 1
+        
+        rm $keytab || exit $?
+    fi
+
+    # collect SPNs for this account
+    mapfile -t spns < <(
+        ldbsearch -H /var/lib/samba/private/sam.ldb \
+            "(sAMAccountName=$acc)" \
+            servicePrincipalName \
+        | awk '/^servicePrincipalName:/ { print $2 }'
+    )
+
+    if [[ ${#spns[@]} -eq 0 ]]; then
+        echo "No SPNs found for $acc"
+        exit 1
+    fi
+
+    # build export command
+    cmd=(samba-tool domain exportkeytab "$keytab" --use-kerberos=off)
+
+    for spn in "${spns[@]}"; do
+        cmd+=(--principal="$spn")
+    done
+
+    echo "Exporting ${#spns[@]} principals for $acc → $keytab"
+    run_cmd "${cmd[@]}"
+}
+
+###
+#
+#
+account_list() {
+    ldbsearch -H /var/lib/samba/private/sam.ldb \
+        "(|(objectClass=user)(objectClass=computer))" \
+        sAMAccountName userAccountControl \
+    | awk '
+        /^dn:/ {
+            name=""
+            uac=""
+        }
+
+        /^sAMAccountName:/ {
+            name = $2
+        }
+
+        /^userAccountControl:/ {
+            if (uac == "") {
+                uac = $2 + 0
+            }
+        }
+
+        /^$/ {
+            if (name == "") next
+
+            if ((uac % 8192) >= 4096) {
+                type = "computer"
+            } else {
+                type = "user"
+            }
+
+            printf "%-20s %s\n", name, type
+
+            # prevent duplicate prints
+            name=""
+            uac=""
+        }
+    '
+}
+
+###
+#
+#
+account_show() {
+    local acc="${1:-}"
+
+    if [[ -z "$acc" ]]; then
+        echo "Missing account" >&2
+        exit 1
+        
+    elif ! account_exists "$acc"; then
+        echo "Account does not exist: $acc" >&2
+        exit 1
+    fi
+
+    ldbsearch -H /var/lib/samba/private/sam.ldb \
+        "(sAMAccountName=$acc)" \
+        dn sAMAccountName userAccountControl servicePrincipalName msDS-KeyVersionNumber \
+    | awk '
+        BEGIN {
+            print_spn = 0
+        }
+
+        /^dn:/ {
+            dn = substr($0, index($0, $2))
+        }
+
+        /^sAMAccountName:/ {
+            name = $2
+        }
+
+        /^userAccountControl:/ {
+            uac = $2 + 0
+        }
+
+        /^msDS-KeyVersionNumber:/ {
+            kvno = $2
+        }
+
+        /^servicePrincipalName:/ {
+            spn[++spn_count] = $2
+        }
+
+        /^$/ {
+            if (name == "") next
+
+            # determine type
+            if ((uac % 8192) >= 4096) {
+                type = "computer"
+            } else {
+                type = "user"
+            }
+
+            printf "Account: %s\n", name
+            printf "Type:    %s\n", type
+            printf "DN:      %s\n", dn
+            printf "UAC:     %d\n", uac
+            printf "KVNO:    %s\n", kvno ? kvno : "N/A"
+
+            print "SPNs:"
+            if (spn_count == 0) {
+                print "  (none)"
+            } else {
+                for (i = 1; i <= spn_count; i++) {
+                    printf "  %s\n", spn[i]
+                }
+            }
+
+            # reset
+            name=""
+            dn=""
+            uac=""
+            kvno=""
+            spn_count=0
+            delete spn
+        }
+    '
+}
+
+###
+#
+#
+account_add() {
+    local name=""
+    local add_nfs=0
+    local add_cifs=0
+
+    # parse args
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --nfs)
+                add_nfs=1
+                shift
+                ;;
+            --cifs)
+                add_cifs=1
+                shift
+                ;;
+            *)
+                name="$1"
+                shift
+                ;;
+        esac
+    done
+
+    if [[ -z "$name" ]]; then
+        echo "Missing account name" >&2
+        exit 1
+
+    elif ldbsearch -H /var/lib/samba/private/sam.ldb \
+        "(sAMAccountName=$name)" dn | grep -q '^dn:'; then
+        echo "Account already exists: $name" >&2
+        exit 1
+
+    elif [[ "$name" == *"$" ]]; then
+        local host realm fqdn
+
+        host="${name%\$}"
+        realm="$(hostname -d)"
+        fqdn="${host}.${realm}"
+    
+        # computer account
+        echo "Creating computer account: $name"
+
+        run_cmd samba-tool computer add "$name"
+
+        # generate key material (randkey equivalent)
+        run_cmd samba-tool user setpassword "$name" --random-password
+        
+        # add HOST principals
+        princ_add "$name" "HOST/${host}"
+        princ_add "$name" "HOST/${fqdn}"
+        
+        # optional SPNs
+        if [[ $add_nfs -eq 1 ]]; then
+            princ_add "$name" "nfs/${host}"
+            princ_add "$name" "nfs/${fqdn}"
+        fi
+
+        if [[ $add_cifs -eq 1 ]]; then
+            princ_add "$name" "cifs/${host}"
+            princ_add "$name" "cifs/${fqdn}"
+        fi
+
+    else
+        # user account
+        echo "Creating user account: $name"
+
+        samba-tool user add "$name"
+        # samba-tool will prompt for password
+    fi
+}
+
+###
+#
+#
+account_delete() {
+    local name="${1:-}"
+    
+    if [[ -z "$name" ]]; then
+        echo "Missing account name" >&2
+        exit 1
+        
+    elif ! account_exists "$name"; then
+        echo "Account does not exist: $name" >&2
+        exit 1
+    fi
+
+    read -rp "Delete $name? [y/N] " confirm
+    [[ "$confirm" == "y" || "$confirm" == "Y" ]] || exit 1
+    
+    if [[ "$name" == *"$" ]]; then
+        echo "Deleting computer account: $name"
+        run_cmd samba-tool computer delete "$name"
+        
+    else
+        echo "Deleting user account: $name"
+        run_cmd samba-tool user delete "$name"
+    fi
+}
+
+###
+#
+#
+account_passwd() {
+    local name="${1:-}"
+
+    if [[ -z "$name" ]]; then
+        echo "Missing account name" >&2
+        exit 1
+        
+    elif ! account_exists "$name"; then
+        echo "Account does not exist: $name" >&2
+        exit 1
+    fi
+    
+    read -rp "Reset password for $name? [y/N] " confirm
+    [[ "$confirm" == "y" || "$confirm" == "Y" ]] || exit 1
+
+    if [[ "$name" == *"$" ]]; then
+        # computer → generate new key material
+        echo "Resetting key (random) for computer: $name"
+
+        run_cmd samba-tool user setpassword "$name" --random-password
+
+    else
+        # user → prompt for password
+        echo "Resetting password for user: $name"
+
+        samba-tool user setpassword "$name"
+    fi
+}
+
+###
+#
+#
+
+require_cmd samba-tool samba
+require_cmd testparm samba-common-bin
+require_cmd ldbsearch ldb-tools
+
+samdb="$(get_samdb)"
+
+[[ -f "$samdb" ]] || {
+    echo "Error: sam.ldb not found (are you on a Samba AD DC?)" >&2
+    exit 1
+}
+
+case "$cmd" in
+    princ)
+        case "$arg" in
+            list|ls)
+                princ_list
+                ;;
+            add)
+                princ_add "${3:-}" "${4:-}"
+                ;;
+            del|delete)
+                princ_del "${3:-}" "${4:-}"
+                ;;
+            export)
+                princ_export "${3:-}" "${4:-}"
+                ;;
+            *)
+                print_usage
+                exit 1
+                ;;
+        esac
+        ;;
+        
+    account)
+        case "$arg" in
+            list|ls)
+                account_list
+                ;;
+            show)
+                account_show "${3:-}"
+                ;;
+            add)
+                account_add "${@:3}"
+                ;;
+            delete|del)
+                account_delete "${3:-}"
+                ;;
+            password|passwd)
+                account_passwd "${3:-}"
+                ;;
+        esac
+        ;;
+    *)
+        print_usage
+        exit 1
+        ;;
+esac
+
