@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+#
+# Synchronized event monitoring of instance states for Incus. 
+# 
+# NOTE:
+#   Because this is synchronized, scripts should be quick and avoid hanging.
+#
+set -euo pipefail
+
+strip_quotes() {
+    local v="$1"
+    v="${v#\"}"   # remove leading quote if present
+    v="${v%\"}"   # remove trailing quote if present
+    printf '%s' "$v"
+}
+
+INST_NAME=""
+INST_NAME_PREV=""
+INST_NAMES=()
+INST_ACTION=""
+LAST_EVENT=""
+
+while IFS= read -r line; do
+    # Incus will print event information line by line and mark the end with a few empty lines.
+    # We will cache the lines that we are interested in and process them when we hit the first empty line.
+    if [[ -z "$line" ]]; then
+        if [[ -n "$INST_NAME_PREV" ]]; then
+            INST_NAMES=("$INST_NAME_PREV" "$INST_NAME")
+        else
+            INST_NAMES=("$INST_NAME")
+        fi
+    
+        # LAST_EVENT acts as a guard against double notification of the same event
+        if [[ -n "${INST_NAMES[0]}" && -n "$INST_ACTION" && "${INST_NAMES[0]}:${INST_ACTION}" != "$LAST_EVENT" ]]; then
+            LAST_EVENT="${INST_NAMES[0]}:${INST_ACTION}"
+        
+            case "$INST_ACTION" in
+                instance-started|instance-restarted)
+                    /etc/rc.cron "incus:started:${INST_NAMES[0]}"
+                ;;
+                
+                instance-shutdown|instance-stopped)
+                    /etc/rc.cron "incus:stopped:${INST_NAMES[0]}"
+                ;;
+                
+                instance-created)
+                    /etc/rc.cron "incus:created:${INST_NAMES[0]}"
+                ;;
+                
+                instance-deleted)
+                    /etc/rc.cron "incus:deleted:${INST_NAMES[0]}"
+                ;;
+                
+                instance-renamed)
+                    /etc/rc.cron "incus:renamed:${INST_NAMES[0]}:${INST_NAMES[1]}"
+                ;;
+            esac
+        fi
+        
+        INST_NAME=""
+        INST_NAME_PREV=""
+        INST_ACTION=""
+        continue
+    fi
+    
+    # We only need the action and the name of the Container/VM
+    trimmed="${line#"${line%%[![:space:]]*}"}"
+    
+    case "$trimmed" in
+        name:\ *)
+            INST_NAME="$(strip_quotes "${trimmed#*: }")"
+        ;;
+        old_name:\ *)
+            INST_NAME_PREV="$(strip_quotes "${trimmed#*: }")"
+        ;;
+        action:\ *)
+            INST_ACTION="$(strip_quotes "${trimmed#*: }")"
+        ;;
+    esac
+    
+done < <(incus monitor --type lifecycle)
+

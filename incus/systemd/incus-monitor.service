@@ -1,0 +1,11 @@
+[Unit]
+Description=Incus Fileserver Lifecycle Hook
+After=incus.service
+Requires=incus.service
+
+[Service]
+ExecStart=/usr/bin/incus-monitor
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
