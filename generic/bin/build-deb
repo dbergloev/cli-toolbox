@@ -109,7 +109,7 @@ declare pkgArch=$(grep '^Architecture:' "$srcPath/control" | cut -d' ' -f2)
 ###
 # Copy requires files
 #
-for file in control preinst postinst prerm postrm; do
+for file in control preinst postinst prerm postrm conffiles; do
     if [[ -f "$srcPath/$file" ]]; then
         printf "Copy %s -> %s\n" "$srcPath/$file" "DEBIAN/"
         cp "$srcPath/$file" $dstBase/DEBIAN/$file
@@ -118,7 +118,8 @@ for file in control preinst postinst prerm postrm; do
 done
 
 # It's faster just to fix it after
-chmod 0644 $dstBase/DEBIAN/control
+chmod 0644 $dstBase/DEBIAN/control 2>/dev/null
+chmod 0644 $dstBase/DEBIAN/conffiles 2>/dev/null
 
 ###
 # Deal with package files
